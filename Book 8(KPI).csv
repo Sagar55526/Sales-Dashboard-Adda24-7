@@ -1,0 +1,3440 @@
+label,Python,Project,,AHLO,NTM,Small cell,ABIO,
+ RIOT Failure Breakdown,"kpi_python_function: def get_riot_failure_breakdown(execute_query, filters=None) -> list[dict]:
+    filters = filters or {}
+
+    # Actual RIOT band columns on stg_nas_e911_readiness_riot_validation
+    default_band_columns = [
+        ""nas_g1900_riot"",
+        ""nas_l600_riot"",
+        ""nas_l700_riot"",
+        ""nas_l850_riot"",
+        ""nas_laws3_riot"",
+        ""nas_l1900_c1_riot"",
+        ""nas_l1900_c2_riot"",
+        ""nas_l2100_c1_riot"",
+        ""nas_l2100_c2_riot"",
+        ""nas_l2500_c1_riot"",
+        ""nas_l2500_c2_riot"",
+        ""nas_n600_c1_riot"",
+        ""nas_n600_c2_riot"",
+        ""nas_n1900_c1_riot"",
+        ""nas_n1900_c2_riot"",
+        ""nas_n2500_c1_riot"",
+        ""nas_n2500_c2_riot"",
+        ""nas_n2500_c3_riot"",
+        ""nas_n2100_c1_riot"",
+        ""nas_u2100_c1_riot"",
+        ""nas_u1900_c1_riot"",
+        ""nas_n24g_c3_riot"",
+    ]
+
+    band_columns = filters.get(""band_columns"") or default_band_columns
+    if isinstance(band_columns, str):
+        band_columns = [c.strip() for c in band_columns.split("","") if c.strip()]
+
+    # Only available drill-down dim on this table is nas_engineer.
+    # Allow turning it off to group by region/market only.
+    drilldown_dim = (filters.get(""drilldown_dim"") or ""nas_engineer"").strip()
+    allowed_drilldowns = {""nas_engineer"", ""none""}
+    if drilldown_dim not in allowed_drilldowns:
+        drilldown_dim = ""nas_engineer""
+
+    null_handling = (filters.get(""null_handling"") or ""not_ready"").lower()
+    # null_handling: 'not_ready' (default) treats NULL/missing as not-ready; 'ignore' excludes NULLs from all-bands-ready evaluation
+    if null_handling not in {""not_ready"", ""ignore""}:
+        null_handling = ""not_ready""
+
+    select_cols = [
+        ""nas_site_id"",
+        ""nas_region"",
+        ""nas_market"",
+        ""nas_engineer"",
+        ""nas_validate_e911_readiness"",
+    ] + band_columns
+
+    def _ident(col: str) -> str:
+        return '""' + col.replace('""', '""""') + '""'
+
+    sql = (
+        ""SELECT ""
+        + "", "".join(_ident(c) for c in select_cols)
+        + "" FROM pwc_macro_staging_schema.stg_nas_e911_readiness_riot_validation""
+        + "" WHERE \""nas_site_id\"" IS NOT NULL""
+    )
+
+    rows = execute_query(sql)
+
+    def _norm_status(v):
+        if v is None:
+            return None
+        s = str(v).strip().upper()
+        if s == """":
+            return None
+        return s
+
+    # Groupings
+    total_sites = {}          # key -> set(site_id)
+    passing_all_bands = {}    # key -> set(site_id)
+    any_failure = {}          # key -> set(site_id)
+    e911_ready = {}           # key -> set(site_id)
+    e911_not_ready = {}       # key -> set(site_id)
+    band_failed_sites = {}    # (key, band_name) -> set(site_id)
+
+    for r in rows:
+        site_id = r.get(""nas_site_id"")
+        if site_id is None:
+            continue
+
+        region = r.get(""nas_region"")
+        market = r.get(""nas_market"")
+        engineer = r.get(""nas_engineer"")
+
+        if drilldown_dim == ""nas_engineer"":
+            key = (region, market, engineer)
+        else:
+            key = (region, market)
+
+        total_sites.setdefault(key, set()).add(site_id)
+
+        # E911 readiness
+        e911_stat = _norm_status(r.get(""nas_validate_e911_readiness""))
+        if e911_stat == ""READY"":
+            e911_ready.setdefault(key, set()).add(site_id)
+        elif e911_stat == ""NOT READY"":
+            e911_not_ready.setdefault(key, set()).add(site_id)
+
+        # Evaluate band statuses for this site
+        statuses = [(bc, _norm_status(r.get(bc))) for bc in band_columns]
+
+        # any failure = any configured band_status == 'NOT READY'
+        if any(st == ""NOT READY"" for _, st in statuses):
+            any_failure.setdefault(key, set()).add(site_id)
+
+        # per-band failures
+        for band_name, st in statuses:
+            if st == ""NOT READY"":
+                band_failed_sites.setdefault((key, band_name), set()).add(site_id)
+
+        # sites_passing_all_bands
+        if null_handling == ""ignore"":
+            considered = [st for _, st in statuses if st is not None]
+            if considered and all(st == ""READY"" for st in considered):
+                passing_all_bands.setdefault(key, set()).add(site_id)
+        else:
+            if all(st == ""READY"" for _, st in statuses):
+                passing_all_bands.setdefault(key, set()).add(site_id)
+
+    results = []
+
+    # Summary rows
+    for key, sites_set in total_sites.items():
+        total = len(sites_set)
+        pass_all = len(passing_all_bands.get(key, set()))
+        any_fail = len(any_failure.get(key, set()))
+        e911_r = len(e911_ready.get(key, set()))
+        e911_nr = len(e911_not_ready.get(key, set()))
+        failure_rate_pct = (any_fail / total * 100.0) if total else None
+
+        if drilldown_dim == ""nas_engineer"":
+            region, market, engineer = key
+        else:
+            region, market = key
+            engineer = None
+
+        row = {
+            ""view_type"": ""summary"",
+            ""nas_region"": region,
+            ""nas_market"": market,
+            ""total_validated_sites"": total,
+            ""sites_passing_all_bands"": pass_all,
+            ""sites_with_any_failure"": any_fail,
+            ""failure_rate_pct"": failure_rate_pct,
+            ""e911_ready_sites"": e911_r,
+            ""e911_not_ready_sites"": e911_nr,
+        }
+        if drilldown_dim == ""nas_engineer"":
+            row.update({
+                ""drilldown_dim"": ""nas_engineer"",
+                ""nas_engineer"": engineer,
+            })
+        results.append(row)
+
+    # Band breakdown rows
+    for key, sites_set in total_sites.items():
+        total = len(sites_set)
+
+        if drilldown_dim == ""nas_engineer"":
+            region, market, engineer = key
+        else:
+            region, market = key
+            engineer = None
+
+        for band_name in band_columns:
+            failed = len(band_failed_sites.get((key, band_name), set()))
+            band_failure_rate_pct = (failed / total * 100.0) if total else None
+            row = {
+                ""view_type"": ""band_breakdown"",
+                ""nas_region"": region,
+                ""nas_market"": market,
+                ""band_name"": band_name,
+                ""failed_sites_band"": failed,
+                ""total_validated_sites"": total,
+                ""band_failure_rate_pct"": band_failure_rate_pct,
+            }
+            if drilldown_dim == ""nas_engineer"":
+                row.update({
+                    ""drilldown_dim"": ""nas_engineer"",
+                    ""nas_engineer"": engineer,
+                })
+            results.append(row)
+
+    return results
+",NAS,,"project_category='AHLOA-B Swap'
+even if someone asks for AHLOA/NTM need to filter 
+on project_category","project_category=""macro""
+even if someone asks for AHLOA/NTM need to filter 
+on project_category",project_category='Small Cell',project_category='ABIO Swap',This KPI is only NAS specific
+ NAS Checkout Rejection,"kpi_python_function: def get_nas_checkout_rejection(execute_query, filters=None) -> list[dict]:
+    """"""NAS Checkout Rejection KPI.
+
+    Returns a single list containing BOTH result sets with a discriminator column:
+      - result_set = 'A' (rate scorecard)
+      - result_set = 'B' (reason breakdown)
+
+    Notes:
+      - Uses raw SQL because the rejection table is not exposed as a Tier-1 core node accessor.
+      - Uses plain SELECT statements with inline subqueries (no CTE/WITH) because the runtime
+        rejects non-SELECT syntax.
+      - Supports optional filters: start_date, end_date, plus optional drilldown fields such as
+        nas_rej_region, nas_rej_market, nas_rej_userid, nas_rej_siteid, nas_session_id, nas_market, etc.
+    """"""
+
+    filters = filters or {}
+
+    def esc(v):
+        return str(v).replace(""'"", ""''"")
+
+    start_date = filters.get('start_date')
+    end_date = filters.get('end_date')
+
+    # Split filters into: rejection-table filters vs session-table filters.
+    # Convention: anything starting with 'nas_rej_' applies to rejection table.
+    # IMPORTANT: do NOT prefix with table aliases (r./s.) because queries use inline subqueries.
+    rej_filter_parts = []
+    sess_filter_parts = []
+
+    for k, v in filters.items():
+        if v is None:
+            continue
+        if k in ('start_date', 'end_date'):
+            continue
+        # Basic allowlist-ish behavior: only simple equality predicates; callers can pass known columns.
+        if k.startswith('nas_rej_'):
+            rej_filter_parts.append(f""{k} = '{esc(v)}'"")
+        else:
+            sess_filter_parts.append(f""{k} = '{esc(v)}'"")
+
+    # Date predicates
+    rej_date_pred = ""TRUE""
+    if start_date and end_date:
+        rej_date_pred = (
+            f""nas_rej_rejection_time >= '{esc(start_date)}' ""
+            f""AND nas_rej_rejection_time < '{esc(end_date)}'""
+        )
+    elif start_date:
+        rej_date_pred = f""nas_rej_rejection_time >= '{esc(start_date)}'""
+    elif end_date:
+        rej_date_pred = f""nas_rej_rejection_time < '{esc(end_date)}'""
+
+    denom_date_pred = ""TRUE""
+    # denominator time uses COALESCE(approve, reject)
+    if start_date and end_date:
+        denom_date_pred = (
+            f""COALESCE(nas_checkout_approve_time, nas_checkout_reject_time) >= '{esc(start_date)}' ""
+            f""AND COALESCE(nas_checkout_approve_time, nas_checkout_reject_time) < '{esc(end_date)}'""
+        )
+    elif start_date:
+        denom_date_pred = f""COALESCE(nas_checkout_approve_time, nas_checkout_reject_time) >= '{esc(start_date)}'""
+    elif end_date:
+        denom_date_pred = f""COALESCE(nas_checkout_approve_time, nas_checkout_reject_time) < '{esc(end_date)}'""
+
+    rej_extra_pred = "" AND "".join(rej_filter_parts) if rej_filter_parts else ""TRUE""
+    sess_extra_pred = "" AND "".join(sess_filter_parts) if sess_filter_parts else ""TRUE""
+
+    sql_a = f""""""
+    SELECT
+      'A'::text AS result_set,
+      ra.nas_rej_region,
+      ra.nas_rej_market,
+      ra.checkout_rejection_count,
+      ra.checkin_rejection_count,
+      ra.total_rejection_sessions,
+      COALESCE(da.total_completed_sessions, 0) AS total_completed_sessions,
+      CASE
+        WHEN COALESCE(da.total_completed_sessions, 0) = 0 THEN NULL
+        ELSE (ra.checkout_rejection_count::numeric / da.total_completed_sessions::numeric) * 100
+      END AS checkout_rejection_rate_pct,
+      NULL::text AS reason_type,
+      NULL::text AS reason_value,
+      NULL::bigint AS reason_count
+    FROM (
+      SELECT
+        nas_rej_region,
+        nas_rej_market,
+        COUNT(DISTINCT nas_rej_sessionid) FILTER (WHERE nas_rej_checkout_reject_reason IS NOT NULL) AS checkout_rejection_count,
+        COUNT(DISTINCT nas_rej_sessionid) FILTER (WHERE nas_rej_checkin_reject_reason IS NOT NULL) AS checkin_rejection_count,
+        COUNT(DISTINCT nas_rej_sessionid) AS total_rejection_sessions
+      FROM pwc_macro_staging_schema.stg_nas_rejection_data_last_30_days
+      WHERE {rej_date_pred}
+        AND ({rej_extra_pred})
+      GROUP BY 1, 2
+    ) ra
+    LEFT JOIN (
+      SELECT
+        nas_market AS nas_rej_market,
+        COUNT(DISTINCT nas_session_id) AS total_completed_sessions
+      FROM pwc_macro_staging_schema.stg_nas_session_level_combined_data
+      WHERE (nas_checkout_approve_time IS NOT NULL OR nas_checkout_reject_time IS NOT NULL)
+        AND {denom_date_pred}
+        AND ({sess_extra_pred})
+      GROUP BY 1
+    ) da
+      ON da.nas_rej_market = ra.nas_rej_market
+    """"""
+
+    sql_b = f""""""
+    SELECT
+      'B'::text AS result_set,
+      x.nas_rej_region,
+      x.nas_rej_market,
+      NULL::bigint AS checkout_rejection_count,
+      NULL::bigint AS checkin_rejection_count,
+      NULL::bigint AS total_rejection_sessions,
+      NULL::bigint AS total_completed_sessions,
+      NULL::numeric AS checkout_rejection_rate_pct,
+      x.reason_type,
+      x.reason_value,
+      x.reason_count
+    FROM (
+      SELECT
+        nas_rej_region,
+        nas_rej_market,
+        'checkin'::text AS reason_type,
+        nas_rej_checkin_reject_reason::text AS reason_value,
+        COUNT(DISTINCT nas_rej_sessionid) AS reason_count
+      FROM pwc_macro_staging_schema.stg_nas_rejection_data_last_30_days
+      WHERE {rej_date_pred}
+        AND ({rej_extra_pred})
+        AND nas_rej_checkin_reject_reason IS NOT NULL
+      GROUP BY 1, 2, 3, 4
+
+      UNION ALL
+
+      SELECT
+        nas_rej_region,
+        nas_rej_market,
+        'checkout'::text AS reason_type,
+        nas_rej_checkout_reject_reason::text AS reason_value,
+        COUNT(DISTINCT nas_rej_sessionid) AS reason_count
+      FROM pwc_macro_staging_schema.stg_nas_rejection_data_last_30_days
+      WHERE {rej_date_pred}
+        AND ({rej_extra_pred})
+        AND nas_rej_checkout_reject_reason IS NOT NULL
+      GROUP BY 1, 2, 3, 4
+    ) x
+    """"""
+
+    rows_a = execute_query(sql_a)
+    rows_b = execute_query(sql_b)
+
+    # Return combined result for callers; they can split by result_set.
+    return (rows_a or []) + (rows_b or [])
+",NAS,,"project_category='AHLOA-B Swap'
+even if someone asks for AHLOA/NTM need to filter 
+on project_category","project_category=""macro""
+even if someone asks for AHLOA/NTM need to filter 
+on project_category",project_category='Small Cell',project_category='ABIO Swap',
+ Site Revisit Rate,"kpi_python_function: def get_site_revisit_rate(execute_query, filters=None) -> list[dict]:
+    """"""Site Revisit Rate
+
+    Step 1 (site grain): completed NAS sessions (nas_checkout_approve_time IS NOT NULL), count distinct nas_session_id per site and vendor/market dims.
+    Step 2 (rollup): per (nas_market, nas_primary_gc) or (nas_market, nas_company_name), compute revisit rate where sites with >2 sessions are revisit sites.
+
+    Supported filters (if present):
+      - start_date, end_date: applied to nas_checkout_approve_time (pushed into SQL)
+      - nas_market, nas_primary_gc, nas_company_name, nas_activity_type, nas_site_id
+      - rollup_by_company_name: bool; if truthy, roll up by (nas_market, nas_company_name) instead of (nas_market, nas_primary_gc)
+      - revisit_threshold: int; default 2 (revisit if session_count > threshold)
+
+    Returns list of dict rows at rollup grain.
+    """"""
+
+    filters = dict(filters or {})
+
+    # Pop control parameters that are not columns
+    rollup_by_company_name = bool(filters.pop('rollup_by_company_name', False))
+    try:
+      revisit_threshold = int(filters.pop('revisit_threshold', 2))
+    except Exception:
+      revisit_threshold = 2
+
+    start_date = filters.pop('start_date', None)
+    end_date = filters.pop('end_date', None)
+
+    def _norm(x):
+      if x is None:
+        return None
+      s = str(x).strip()
+      return s if s != '' else None
+
+    # Pull completed sessions from session-level combined table (includes nas_checkout_approve_time)
+    where = [""nas_checkout_approve_time IS NOT NULL""]
+
+    # Optional dimension filters (pushed down to SQL)
+    if filters.get('nas_market') is not None:
+      where.append(f""nas_market = '{str(filters.get('nas_market')).replace(""'"", ""''"")}'"")
+    if filters.get('nas_primary_gc') is not None:
+      where.append(f""nas_primary_gc = '{str(filters.get('nas_primary_gc')).replace(""'"", ""''"")}'"")
+    if filters.get('nas_company_name') is not None:
+      where.append(f""nas_company_name = '{str(filters.get('nas_company_name')).replace(""'"", ""''"")}'"")
+    if filters.get('nas_activity_type') is not None:
+      where.append(f""nas_activity_type = '{str(filters.get('nas_activity_type')).replace(""'"", ""''"")}'"")
+    if filters.get('nas_site_id') is not None:
+      where.append(f""nas_site_id = '{str(filters.get('nas_site_id')).replace(""'"", ""''"")}'"")
+
+    # Optional date filters (pushed down to SQL on approve time)
+    # Assumes start_date/end_date are compatible with the warehouse (date or timestamp literal strings).
+    if start_date is not None:
+      where.append(f""nas_checkout_approve_time >= '{str(start_date).replace(""'"", ""''"")}'"")
+    if end_date is not None:
+      where.append(f""nas_checkout_approve_time <= '{str(end_date).replace(""'"", ""''"")}'"")
+
+    sql = f""""""
+SELECT
+  nas_session_id,
+  nas_site_id,
+  nas_market,
+  nas_primary_gc,
+  nas_company_name,
+  nas_activity_type,
+  nas_checkout_approve_time
+FROM pwc_macro_staging_schema.stg_nas_session_level_combined_data
+WHERE {' AND '.join(where)}
+"""""".strip()
+
+    rows = execute_query(sql)
+
+    # Step 1: (completion already enforced in SQL) keep Python-side normalization/guardrails
+    filtered = []
+    for r in rows:
+      approve_time = r.get('nas_checkout_approve_time', None)
+      if approve_time is None:
+        continue
+      filtered.append(r)
+
+    # Site-grain aggregation: count distinct sessions per (market, vendor_dim, site)
+    site_sessions = {}  # key: (market, vendor_dim, site_id) -> set(session_id)
+    for r in filtered:
+      market = _norm(r.get('nas_market'))
+      primary_gc = _norm(r.get('nas_primary_gc'))
+      company_name = _norm(r.get('nas_company_name'))
+      site_id = _norm(r.get('nas_site_id'))
+      session_id = _norm(r.get('nas_session_id'))
+
+      if site_id is None or session_id is None:
+        continue
+
+      vendor_dim = company_name if rollup_by_company_name else primary_gc
+
+      # Keep null vendor buckets explicit (so totals reconcile)
+      k = (market, vendor_dim, site_id)
+      if k not in site_sessions:
+        site_sessions[k] = set()
+      site_sessions[k].add(session_id)
+
+    # Step 2: roll up to (market, vendor_dim)
+    rollup = {}
+    # key: (market, vendor_dim) -> {sites:set, revisit_sites:set, session_counts:[...]}
+    for (market, vendor_dim, site_id), sess_set in site_sessions.items():
+      session_count = len(sess_set)
+      is_revisit_site = session_count > revisit_threshold
+
+      rk = (market, vendor_dim)
+      if rk not in rollup:
+        rollup[rk] = {
+          'sites': set(),
+          'revisit_sites': set(),
+          'session_counts': []
+        }
+      rollup[rk]['sites'].add(site_id)
+      if is_revisit_site:
+        rollup[rk]['revisit_sites'].add(site_id)
+      rollup[rk]['session_counts'].append(session_count)
+
+    out = []
+    for (market, vendor_dim), agg in rollup.items():
+      sites_with_sessions = len(agg['sites'])
+      revisit_sites = len(agg['revisit_sites'])
+      revisit_rate_pct = (100.0 * revisit_sites / sites_with_sessions) if sites_with_sessions else None
+      sc = agg['session_counts']
+      avg_sessions_per_site = (sum(sc) / len(sc)) if sc else None
+
+      row = {
+        'nas_market': market,
+        ('nas_company_name' if rollup_by_company_name else 'nas_primary_gc'): vendor_dim,
+        'sites_with_sessions': sites_with_sessions,
+        'revisit_sites': revisit_sites,
+        'revisit_rate_pct': revisit_rate_pct,
+        'avg_sessions_per_site': avg_sessions_per_site,
+        'revisit_threshold_sessions_gt': revisit_threshold
+      }
+      out.append(row)
+
+    # stable ordering
+    out.sort(key=lambda x: (str(x.get('nas_market') or ''), str(x.get('nas_company_name') or x.get('nas_primary_gc') or '')))
+    return out
+",NAS,,"project_category='AHLOA-B Swap'
+even if someone asks for AHLOA/NTM need to filter 
+on project_category","project_category=""macro""
+even if someone asks for AHLOA/NTM need to filter 
+on project_category",project_category='Small Cell',project_category='ABIO Swap',"For AHLO refer hse_checklist table only when it is more than once otherwise no revisit appened
+For NTM if there is rejection and re-submission happened then there is revisit happened consider SCOP 
+resubmission in combined table"
+"
+NAS Integration SLA","kpi_python_function: def get_nas_integration_sla(execute_query, filters=None) -> list[dict]:
+    filters = filters or {}
+
+    # Integration Activity accessor doesn't expose required measure fields,
+    # so we aggregate via raw SQL from the session-level combined table.
+
+    # Base predicate: only completed sessions (approve time present)
+    where = [""nas_checkout_approve_time IS NOT NULL""]
+
+    # Date range filtering applies to approve time (the KPI's time anchor)
+    if filters.get('start_date') is not None:
+        sd = str(filters.get('start_date')).replace(""'"", ""''"")
+        where.append(f""nas_checkout_approve_time >= '{sd}'"")
+    if filters.get('end_date') is not None:
+        ed = str(filters.get('end_date')).replace(""'"", ""''"")
+        where.append(f""nas_checkout_approve_time < '{ed}'"")
+
+    # Optional dimension filters
+    dim_filter_map = {
+        'nas_market': 'nas_market',
+        'nas_activity_type': 'nas_activity_type',
+        'nas_company_name': 'nas_company_name',
+        'nas_vendor_name': 'nas_vendor_name',
+        'nas_primary_gc': 'nas_primary_gc',
+        'nas_session_id': 'nas_session_id',
+        'nas_site_id': 'nas_site_id',
+        'nas_project_category': 'nas_project_category',
+        'nas_date_period': 'nas_date_period'
+    }
+    for fk, col in dim_filter_map.items():
+        if filters.get(fk) is not None:
+            val = str(filters.get(fk)).replace(""'"", ""''"")
+            where.append(f""{col} = '{val}'"")
+
+    # Time grouping
+    time_grain = (filters.get('time_grain') or filters.get('date_bucket_grain') or 'day').lower()
+    if time_grain in ('week', 'weekly'):
+        date_bucket_expr = ""date_trunc('week', nas_checkout_approve_time)::date""
+    else:
+        date_bucket_expr = ""nas_checkout_approve_time::date""
+
+    where_sql = ""\n  AND "".join(where)
+
+    # Option A (single-table): use nas_status_nest_ext as extension proxy.
+    sql = f""""""
+SELECT
+  nas_market,
+  nas_activity_type,
+  nas_company_name,
+  {date_bucket_expr} AS date_bucket,
+
+  COUNT(DISTINCT nas_session_id) AS completed_sessions,
+
+  100.0 * COUNT(DISTINCT CASE WHEN nas_status_nest_ext IS NULL THEN nas_session_id END)
+    / NULLIF(COUNT(DISTINCT nas_session_id), 0) AS checkout_sla_rate_pct,
+
+  100.0 * COUNT(DISTINCT CASE WHEN nas_status_nest_ext IS NOT NULL THEN nas_session_id END)
+    / NULLIF(COUNT(DISTINCT nas_session_id), 0) AS extension_rate_pct,
+
+  AVG(nas_total_activity_duration::numeric) AS avg_activity_duration
+
+FROM pwc_macro_staging_schema.stg_nas_session_level_combined_data
+WHERE {where_sql}
+GROUP BY
+  nas_market,
+  nas_activity_type,
+  nas_company_name,
+  {date_bucket_expr}
+ORDER BY
+  date_bucket,
+  nas_market,
+  nas_activity_type,
+  nas_company_name
+""""""
+
+    return execute_query(sql)
+",NAS,,"project_category='AHLOA-B Swap'
+even if someone asks for AHLOA/NTM need to filter 
+on project_category","project_category=""macro""
+even if someone asks for AHLOA/NTM need to filter 
+on project_category",project_category='Small Cell',project_category='ABIO Swap',
+ On-Air Cycle Time,"kpi_python_function: def get_on_air_cycle_time(execute_query, filters=None) -> list[dict]:
+    """"""On-Air Cycle Time (days) = avg( on_air_date - construction_start_date )
+
+    construction_start_date := pj_a_4225_construction_start_finish
+    on_air_date := MIN(non-null pj_*_onair_finish) across all columns matching '*onair_finish*'
+
+    Filters accepted (best-effort): start_date/end_date applied to on_air_date if present, else construction_start_date.
+    Also supports site_code, market, gc.
+    """"""
+
+    def _to_date_str(v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s[:10] if len(s) >= 10 else s
+
+    def _parse_yyyy_mm_dd(v):
+        s = _to_date_str(v)
+        if not s or len(s) < 10:
+            return None
+        try:
+            y = int(s[0:4]); m = int(s[5:7]); d = int(s[8:10])
+            # return ordinal to compute day-diffs without imports
+            # algorithm: days from civil (Howard Hinnant)
+            a = (14 - m) // 12
+            y2 = y + 4800 - a
+            m2 = m + 12 * a - 3
+            jdn = d + ((153 * m2 + 2) // 5) + 365 * y2 + (y2 // 4) - (y2 // 100) + (y2 // 400) - 32045
+            return jdn
+        except Exception:
+            return None
+
+    def _min_non_null_date_from_row(row, key_substr):
+        best = None
+        for k, v in row.items():
+            if v is None:
+                continue
+            k_l = str(k).lower()
+            if key_substr in k_l:
+                j = _parse_yyyy_mm_dd(v)
+                if j is None:
+                    continue
+                if best is None or j < best:
+                    best = j
+        return best
+
+    filters = filters or {}
+    start_date = _parse_yyyy_mm_dd(filters.get('start_date'))
+    end_date = _parse_yyyy_mm_dd(filters.get('end_date'))
+
+    # Build a base filter set for Tier-1 accessor. Note: accessor may ignore unknown keys;
+    # we keep only common attributes that are known to exist on the wide table.
+    base_filters = {}
+    if filters.get('site_code'):
+        # most tables use s_site_id as the site code; accessor returns it as site_code
+        base_filters['s_site_id'] = filters.get('site_code')
+    if filters.get('market'):
+        base_filters['m_market'] = filters.get('market')
+    if filters.get('gc'):
+        # prefer construction_gc if present, else pj_general_contractor
+        base_filters['construction_gc'] = filters.get('gc')
+
+    # We need milestone columns (pj_a_4225... and pj_*_onair_finish) which are not included
+    # in the Project node's returned columns. Use raw SQL against the wide table.
+    where_parts = []
+    if base_filters.get('s_site_id'):
+        esc = str(base_filters['s_site_id']).replace(""'"", ""''"")
+        where_parts.append(f""s_site_id = '{esc}'"")
+    if base_filters.get('m_market'):
+        esc = str(base_filters['m_market']).replace(""'"", ""''"")
+        where_parts.append(f""m_market = '{esc}'"")
+    if base_filters.get('construction_gc'):
+        esc = str(base_filters['construction_gc']).replace(""'"", ""''"")
+        # match either construction_gc or pj_general_contractor (free-text duplicates)
+        where_parts.append(f""(construction_gc = '{esc}' OR pj_general_contractor = '{esc}')"")
+
+    where_sql = (""WHERE "" + "" AND "".join(where_parts)) if where_parts else """"
+
+    sql = (
+        ""SELECT * ""
+        ""FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined ""
+        f""{where_sql}""
+    )
+    rows = execute_query(sql)
+
+    total_days = 0
+    n = 0
+
+    for r in rows:
+        site_code = r.get('s_site_id')
+        market = r.get('m_market')
+        gc = r.get('construction_gc') or r.get('pj_general_contractor')
+        project_id = r.get('pj_project_id')
+
+        construction_start = _parse_yyyy_mm_dd(r.get('pj_a_4225_construction_start_finish'))
+        # heuristic: any column containing 'onair_finish' is considered an on-air completion timestamp
+        on_air = _min_non_null_date_from_row(r, 'onair_finish')
+
+        if construction_start is None or on_air is None:
+            continue
+
+        # Apply date range filter: prefer on_air date; if missing (shouldn't happen), fallback to construction_start
+        anchor = on_air if on_air is not None else construction_start
+        if start_date is not None and anchor < start_date:
+            continue
+        if end_date is not None and anchor > end_date:
+            continue
+
+        cycle_days = on_air - construction_start
+        # ignore negative durations (bad data)
+        if cycle_days is None or cycle_days < 0:
+            continue
+
+        total_days += cycle_days
+        n += 1
+
+    avg_days = (total_days / n) if n else None
+
+    return [
+        {
+            'kpi': 'On-Air Cycle Time',
+            'avg_cycle_time_days': avg_days,
+            'projects_count': n,
+            'filters_applied': {
+                'start_date': _to_date_str(filters.get('start_date')),
+                'end_date': _to_date_str(filters.get('end_date')),
+                'site_code': filters.get('site_code'),
+                'market': filters.get('market'),
+                'gc': filters.get('gc')
+            }
+        }
+    ]
+",NTM/AHLOA,,"Difference (ms_1970_integration_complete_actual
+, ms_1550_construction_start_actual)","Difference (ms_1970_integration_complete_actual
+, ms_1550_construction_start_actual)",,,
+ GC Performance Scorecard,"kpi_python_function: def get_gc_performance_scorecard(execute_query, filters=None) -> list[dict]:
+    """"""Composite GC scorecard grouped by (rgn_region, m_area, m_market, pj_general_contractor).
+
+    Measures:
+      1) plan_achievement_pct
+      2) avg_cx_cycle_days
+      3) ftr_rate_pct
+      4) active_backlog_wip
+      5) on_air_pending
+
+    Notes:
+      - NULL-safe denominators: return None when denominator == 0.
+      - Prefers Tier-1 accessors where possible, but required columns (milestone dates, first_time_right)
+        are not exposed by the current accessor return columns, so this uses raw SQL.
+    """"""
+
+    filters = filters or {}
+
+    def esc(v):
+        return str(v).replace(""'"", ""''"")
+
+    # We need milestone/date columns + first_time_right, which are not available in Tier-1 accessor outputs.
+    # Therefore, query the source table directly with dynamic filters.
+    where_parts = []
+
+    # Optional dimension filters (if provided)
+    for k in [
+        'rgn_region', 'm_area', 'm_market', 'pj_general_contractor', 'pj_project_id', 's_site_id',
+        'pj_project_status', 'pj_project_type', 'pj_program_name'
+    ]:
+        if filters.get(k) is not None:
+            where_parts.append(f""{k} = '{esc(filters.get(k))}'"")
+
+    # Date range filtering (optional). Apply to construction start actual by default for weekly planning window.
+    # If you need alternate behavior (e.g., filter by completion date), pass filters['date_field'].
+    date_field = filters.get('date_field') or 'ms_1550_construction_start_actual'
+    if filters.get('start_date'):
+        where_parts.append(f""{date_field}::date >= '{esc(filters.get('start_date'))}'::date"")
+    if filters.get('end_date'):
+        where_parts.append(f""{date_field}::date <= '{esc(filters.get('end_date'))}'::date"")
+
+    where_sql = (""WHERE "" + "" AND "".join(where_parts)) if where_parts else """"
+
+    sql = f""""""
+        SELECT
+            rgn_region,
+            m_area,
+            m_market,
+            pj_general_contractor,
+            pj_project_id,
+            ms_1550_construction_start_actual,
+            ms_1555_construction_complete_actual,
+            ms_1556_punch_checklist_audit_completed_by_nokia_actual,
+            first_time_right,
+            pj_completion_objective_actual_date
+        FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined
+        {where_sql}
+    """"""
+
+    rows = execute_query(sql)
+
+    # Group and aggregate in Python
+    groups = {}
+
+    def to_date(val):
+        if val is None:
+            return None
+        s = str(val)
+        # expected formats like 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS'
+        return s[:10] if len(s) >= 10 else None
+
+    def date_diff_days(d2, d1):
+        # d2 - d1 in days, both are 'YYYY-MM-DD'
+        if (d1 is None) or (d2 is None):
+            return None
+        # Avoid imports; use Postgres for date diff if needed, but we are already in Python.
+        # Minimal pure-Python date diff without datetime import is not reliable.
+        # Fallback: compute using a SQL helper per row is too expensive.
+        # Instead, re-query with SQL computing cycle_days, which is safe and efficient.
+        return None
+
+    # If we need accurate cycle days without importing datetime, do a second SQL that computes it.
+    # This stays within KPI rules and avoids Python datetime import.
+    # Build a project-level cycle-days lookup keyed by pj_project_id.
+    # (This is still one table; no joins.)
+    sql_cycle = f""""""
+        SELECT
+            pj_project_id,
+            (ms_1555_construction_complete_actual::date - ms_1550_construction_start_actual::date) AS cx_cycle_days
+        FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined
+        {where_sql}
+    """"""
+    cycle_rows = execute_query(sql_cycle)
+    cycle_by_project = {r.get('pj_project_id'): r.get('cx_cycle_days') for r in cycle_rows}
+
+    for r in rows:
+        key = (
+            r.get('rgn_region'),
+            r.get('m_area'),
+            r.get('m_market'),
+            r.get('pj_general_contractor')
+        )
+        if key not in groups:
+            groups[key] = {
+                'rgn_region': r.get('rgn_region'),
+                'm_area': r.get('m_area'),
+                'm_market': r.get('m_market'),
+                'pj_general_contractor': r.get('pj_general_contractor'),
+                # sets for distinct counts
+                '_plan_den': set(),
+                '_plan_num': set(),
+                '_ftr_den': set(),
+                '_ftr_num': set(),
+                '_wip': set(),
+                '_on_air_pending': set(),
+                # cycle days
+                '_cycle_sum': 0.0,
+                '_cycle_cnt': 0
+            }
+
+        g = groups[key]
+        pid = r.get('pj_project_id')
+        if not pid:
+            continue
+
+        start_actual = r.get('ms_1550_construction_start_actual')
+        complete_actual = r.get('ms_1555_construction_complete_actual')
+        audit_completed = r.get('ms_1556_punch_checklist_audit_completed_by_nokia_actual')
+        ftr = r.get('first_time_right')
+        completion_objective_actual = r.get('pj_completion_objective_actual_date')
+
+        # (1) Plan Achievement %
+        if start_actual is not None:
+            g['_plan_den'].add(pid)
+            if complete_actual is not None:
+                g['_plan_num'].add(pid)
+
+        # (2) Avg CX Cycle Days
+        if (start_actual is not None) and (complete_actual is not None):
+            cd = cycle_by_project.get(pid)
+            if cd is not None:
+                try:
+                    g['_cycle_sum'] += float(cd)
+                    g['_cycle_cnt'] += 1
+                except Exception:
+                    pass
+
+        # (3) FTR Rate %
+        if audit_completed is not None:
+            g['_ftr_den'].add(pid)
+            if str(ftr).strip().lower() == 'yes':
+                g['_ftr_num'].add(pid)
+
+        # (4) Active Backlog (WIP)
+        if (start_actual is not None) and (complete_actual is None):
+            g['_wip'].add(pid)
+
+        # (5) On-Air Pending
+        if (complete_actual is not None) and (completion_objective_actual is None):
+            g['_on_air_pending'].add(pid)
+
+    out = []
+    for key, g in groups.items():
+        plan_den = len(g['_plan_den'])
+        plan_num = len(g['_plan_num'])
+        ftr_den = len(g['_ftr_den'])
+        ftr_num = len(g['_ftr_num'])
+
+        plan_pct = (100.0 * plan_num / plan_den) if plan_den > 0 else None
+        ftr_pct = (100.0 * ftr_num / ftr_den) if ftr_den > 0 else None
+        avg_cycle = (g['_cycle_sum'] / g['_cycle_cnt']) if g['_cycle_cnt'] > 0 else None
+
+        out.append({
+            'rgn_region': g['rgn_region'],
+            'm_area': g['m_area'],
+            'm_market': g['m_market'],
+            'pj_general_contractor': g['pj_general_contractor'],
+            'plan_achievement_pct': plan_pct,
+            'avg_cx_cycle_days': avg_cycle,
+            'ftr_rate_pct': ftr_pct,
+            'active_backlog_wip': len(g['_wip']),
+            'on_air_pending': len(g['_on_air_pending'])
+        })
+
+    return out
+",NTM/AHLOA,    SELECT, , ,,,ms_1557 should be there instead of ms_1556
+ Scoping Cycle Time & Quality,"kpi_python_function: def get_scoping_cycle_time_quality(execute_query, filters=None) -> list[dict]:
+    """"""Per-market (region/area/market) scorecard KPI for scoping cycle time, backlog, and FTR quality.
+
+    Filters supported (optional):
+      - rgn_region, m_area, m_market
+      - pj_general_contractor
+      - start_date, end_date: applied to ms_1310 (package received) for cycle/backlog measures
+      - rcm_assignee: drilldown for FTR
+      - ftr_join_mode: 'site' (default) to inherit macro market via rcm_site_id->s_site_id; 'rcm' to group by (rcm_region, rcm_market)
+
+    Returns: list of dict rows at grain (rgn_region, m_area, m_market, pj_general_contractor?) with multiple measures.
+    """"""
+
+    filters = filters or {}
+
+    # -----------------------------
+    # Helpers
+    # -----------------------------
+    from datetime import datetime, date
+
+    def _parse_date(x):
+        if x is None:
+            return None
+        if isinstance(x, date) and not isinstance(x, datetime):
+            return x
+        if isinstance(x, datetime):
+            return x.date()
+        s = str(x).strip()
+        if not s:
+            return None
+        # Handle common formats: 'YYYY-MM-DD', 'YYYY-MM-DD HH:MM:SS', ISO
+        try:
+            return datetime.fromisoformat(s.replace('Z', '')).date()
+        except Exception:
+            # fallback: take first 10 chars if looks like date
+            try:
+                return datetime.strptime(s[:10], '%Y-%m-%d').date()
+            except Exception:
+                return None
+
+    def _days_diff(d2, d1):
+        # d2 - d1 in days
+        if d1 is None or d2 is None:
+            return None
+        return (d2 - d1).days
+
+    def _percentile_cont(sorted_vals, p):
+        # Continuous percentile like Postgres percentile_cont
+        n = len(sorted_vals)
+        if n == 0:
+            return None
+        if n == 1:
+            return float(sorted_vals[0])
+        if p <= 0:
+            return float(sorted_vals[0])
+        if p >= 1:
+            return float(sorted_vals[-1])
+        pos = (n - 1) * p
+        lo = int(pos)
+        hi = lo + 1
+        if hi >= n:
+            return float(sorted_vals[lo])
+        frac = pos - lo
+        return float(sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * frac)
+
+    def _in_date_range(d, start_d, end_d):
+        if d is None:
+            return False
+        if start_d and d < start_d:
+            return False
+        if end_d and d > end_d:
+            return False
+        return True
+
+    # -----------------------------
+    # Load macro project rows (Tier 2: raw SQL needed because milestone date columns are not exposed by Tier-1 accessors)
+    # -----------------------------
+    start_d = _parse_date(filters.get('start_date'))
+    end_d = _parse_date(filters.get('end_date'))
+
+    where = []
+    if filters.get('rgn_region'):
+        v = str(filters['rgn_region']).replace(""'"", ""''"")
+        where.append(f""rgn_region = '{v}'"")
+    if filters.get('m_area'):
+        v = str(filters['m_area']).replace(""'"", ""''"")
+        where.append(f""m_area = '{v}'"")
+    if filters.get('m_market'):
+        v = str(filters['m_market']).replace(""'"", ""''"")
+        where.append(f""m_market = '{v}'"")
+    if filters.get('pj_general_contractor'):
+        v = str(filters['pj_general_contractor']).replace(""'"", ""''"")
+        where.append(f""pj_general_contractor = '{v}'"")
+    # Note: start/end date are applied after fetch (to ms_1310), to avoid casting issues and keep logic explicit.
+
+    where_sql = (""WHERE "" + "" AND "".join(where)) if where else """"
+
+    macro_sql = (
+        ""SELECT ""
+        ""  pj_project_id, pj_project_status, pj_general_contractor, ""
+        ""  rgn_region, m_area, m_market, ""
+        ""  s_site_id, ""
+        ""  ms_1310_pre_construction_package_received_actual, ""
+        ""  ms_1323_ready_for_scoping_actual, ""
+        ""  ms_1327_scoping_and_quoting_package_validated_actual ""
+        ""FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined ""
+        f""{where_sql}""
+    )
+
+    macro_rows = execute_query(macro_sql)
+
+    # Build site->(region,area,market,gc) mapping for FTR join option A
+    site_dim = {}
+    for r in macro_rows:
+        site_id = r.get('s_site_id')
+        if site_id and site_id not in site_dim:
+            site_dim[site_id] = {
+                'rgn_region': r.get('rgn_region'),
+                'm_area': r.get('m_area'),
+                'm_market': r.get('m_market'),
+                'pj_general_contractor': r.get('pj_general_contractor')
+            }
+
+    # -----------------------------
+    # Compute cycle-time and backlog measures per group
+    # Grouping = (rgn_region, m_area, m_market) + optionally pj_general_contractor if provided as drilldown
+    # -----------------------------
+    drill_gc = bool(filters.get('pj_general_contractor'))
+
+    groups = {}  # key -> accumulator
+    for r in macro_rows:
+        pj_project_id = r.get('pj_project_id')
+        if not pj_project_id:
+            continue
+
+        region = r.get('rgn_region')
+        area = r.get('m_area')
+        market = r.get('m_market')
+        gc = r.get('pj_general_contractor')
+
+        key = (region, area, market, gc) if drill_gc else (region, area, market)
+        if key not in groups:
+            groups[key] = {
+                'projects_seen': set(),
+                'pre_to_ready_diffs': [],
+                'ready_to_val_diffs': [],
+                'full_cycle_diffs': [],
+                'pending_projects': set()
+            }
+
+        acc = groups[key]
+        acc['projects_seen'].add(pj_project_id)
+
+        d1310 = _parse_date(r.get('ms_1310_pre_construction_package_received_actual'))
+        d1323 = _parse_date(r.get('ms_1323_ready_for_scoping_actual'))
+        d1327 = _parse_date(r.get('ms_1327_scoping_and_quoting_package_validated_actual'))
+
+        # Optional date filtering applied on package received date (ms_1310)
+        if (start_d or end_d):
+            # only include rows where ms_1310 exists and falls in range
+            if not _in_date_range(d1310, start_d, end_d):
+                # still allow pending backlog? spec says backlog component primary source; keep consistent with same cohort
+                continue
+
+        # Pre-NTP to Scoping Ready
+        diff = _days_diff(d1323, d1310)
+        if diff is not None and diff >= 0:
+            acc['pre_to_ready_diffs'].append(diff)
+
+        # Scoping Ready to Validated
+        diff = _days_diff(d1327, d1323)
+        if diff is not None and diff >= 0:
+            acc['ready_to_val_diffs'].append(diff)
+
+        # Full Scoping Cycle
+        diff = _days_diff(d1327, d1310)
+        if diff is not None and diff >= 0:
+            acc['full_cycle_diffs'].append(diff)
+
+        # Pending Scoping Count
+        if (r.get('pj_project_status') == 'Active') and (d1310 is not None) and (d1327 is None):
+            acc['pending_projects'].add(pj_project_id)
+
+    # -----------------------------
+    # Load RCM rows and compute FTR
+    # -----------------------------
+    ftr_join_mode = (filters.get('ftr_join_mode') or 'site').lower().strip()  # 'site' or 'rcm'
+
+    rcm_filters = {}
+    # Pass-through entity filters when possible
+    if filters.get('rcm_assignee'):
+        rcm_filters['rcm_assignee'] = filters.get('rcm_assignee')
+    if filters.get('m_market') and ftr_join_mode == 'rcm':
+        # only applies if ftr_join_mode='rcm' and rcm_market exists
+        rcm_filters['rcm_market'] = filters.get('m_market')
+    if filters.get('rgn_region') and ftr_join_mode == 'rcm':
+        rcm_filters['rcm_region'] = filters.get('rgn_region')
+
+    rcm_rows = get_scoping_package(execute_query, rcm_filters)
+
+    ftr_groups = {}  # key -> {'num': int, 'den': int}
+    for r in rcm_rows:
+        state = r.get('rcm_state')
+        if state != 'completed':
+            continue
+
+        # denominator always counts completed
+        if ftr_join_mode == 'site':
+            site_id = r.get('rcm_site_id')
+            dim = site_dim.get(site_id) if site_id else None
+            if not dim:
+                # if we cannot map to macro market, skip rather than mis-attribute
+                continue
+            region = dim.get('rgn_region')
+            area = dim.get('m_area')
+            market = dim.get('m_market')
+            gc = dim.get('pj_general_contractor')
+            key = (region, area, market, gc) if drill_gc else (region, area, market)
+        else:
+            # 'rcm' mode: grouped by (rcm_region, rcm_market); m_area is unknown -> None
+            region = r.get('rcm_region')
+            market = r.get('rcm_market')
+            area = None
+            gc = None
+            key = (region, area, market, gc) if drill_gc else (region, area, market)
+
+        if key not in ftr_groups:
+            ftr_groups[key] = {'num': 0, 'den': 0}
+
+        ftr_groups[key]['den'] += 1
+        if r.get('rcm_ftr') == 'option1':
+            ftr_groups[key]['num'] += 1
+
+    # -----------------------------
+    # Assemble output
+    # -----------------------------
+    out = []
+    for key, acc in groups.items():
+        if drill_gc:
+            region, area, market, gc = key
+        else:
+            region, area, market = key
+            gc = None
+
+        def _avg(vals):
+            return (sum(vals) / len(vals)) if vals else None
+
+        pre_sorted = sorted(acc['pre_to_ready_diffs'])
+        rtv_sorted = sorted(acc['ready_to_val_diffs'])
+        full_sorted = sorted(acc['full_cycle_diffs'])
+
+        ftr = ftr_groups.get(key, {'num': 0, 'den': 0})
+        ftr_pct = (100.0 * ftr['num'] / ftr['den']) if ftr['den'] else None
+
+        row = {
+            'rgn_region': region,
+            'm_area': area,
+            'm_market': market,
+            'avg_pre_ntp_to_scoping_ready_days': _avg(pre_sorted),
+            'p50_pre_ntp_to_scoping_ready_days': _percentile_cont(pre_sorted, 0.5),
+            'avg_scoping_ready_to_validated_days': _avg(rtv_sorted),
+            'p50_scoping_ready_to_validated_days': _percentile_cont(rtv_sorted, 0.5),
+            'avg_full_scoping_cycle_days': _avg(full_sorted),
+            'p50_full_scoping_cycle_days': _percentile_cont(full_sorted, 0.5),
+            'pending_scoping_count': len(acc['pending_projects']),
+            'scoping_ftr_pct': ftr_pct,
+            'scoping_ftr_numerator_completed_ftr': ftr['num'],
+            'scoping_ftr_denominator_completed': ftr['den'],
+            'project_count_in_cohort': len(acc['projects_seen'])
+        }
+        if drill_gc:
+            row['pj_general_contractor'] = gc
+        out.append(row)
+
+    # Include any FTR-only groups that didn't exist in macro cohort (optional, but useful in 'rcm' mode)
+    # Only add when ftr_join_mode != 'site' (otherwise groups should generally align to macro table).
+    if ftr_join_mode != 'site':
+        existing_keys = set(groups.keys())
+        for key, ftr in ftr_groups.items():
+            if key in existing_keys:
+                continue
+            if drill_gc:
+                region, area, market, gc = key
+            else:
+                region, area, market = key
+                gc = None
+            ftr_pct = (100.0 * ftr['num'] / ftr['den']) if ftr['den'] else None
+            row = {
+                'rgn_region': region,
+                'm_area': area,
+                'm_market': market,
+                'avg_pre_ntp_to_scoping_ready_days': None,
+                'p50_pre_ntp_to_scoping_ready_days': None,
+                'avg_scoping_ready_to_validated_days': None,
+                'p50_scoping_ready_to_validated_days': None,
+                'avg_full_scoping_cycle_days': None,
+                'p50_full_scoping_cycle_days': None,
+                'pending_scoping_count': 0,
+                'scoping_ftr_pct': ftr_pct,
+                'scoping_ftr_numerator_completed_ftr': ftr['num'],
+                'scoping_ftr_denominator_completed': ftr['den'],
+                'project_count_in_cohort': 0
+            }
+            if drill_gc:
+                row['pj_general_contractor'] = gc
+            out.append(row)
+
+    # Stable sort
+    def _s(x):
+        return (x.get('rgn_region') or '', x.get('m_area') or '', x.get('m_market') or '', x.get('pj_general_contractor') or '')
+
+    out.sort(key=_s)
+    return out
+",NTM/AHLOA,"        s_site_id AS site_code,",,,,,"ms_1331(scoping reviwed by GC), ms_1333(scoping 
+package approved by GC) can be used
+"
+ CX Cycle Time,"kpi_python_function: def get_cx_cycle_time(execute_query, filters=None) -> list[dict]:
+    """"""CX Cycle Time
+    Computes per-project construction cycle days and publishes grouped aggregates:
+      avg, p50 (median), p90, max.
+
+    Inclusion criteria (per project row):
+      - ms_1550_construction_start_actual IS NOT NULL
+      - ms_1555_construction_complete_actual IS NOT NULL
+      - (complete::date - start::date) >= 0
+
+    Group-by dimensions:
+      rgn_region, m_area, m_market, pj_general_contractor
+    Optional slices (if present in data):
+      por_category, s_site_class
+
+    Filters (optional):
+      - start_date/end_date: applied to construction_complete_actual::date (common reporting anchor)
+      - rgn_region, m_area, m_market, pj_general_contractor, por_category, s_site_class, pj_project_id, s_site_id
+    """"""
+
+    filters = filters or {}
+
+    # Need milestone date columns not exposed via Tier-1 accessors, plus optional slice columns.
+    where_parts = [
+        ""ms_1550_construction_start_actual IS NOT NULL"",
+        ""ms_1555_construction_complete_actual IS NOT NULL"",
+        ""(ms_1555_construction_complete_actual::date - ms_1550_construction_start_actual::date) >= 0""
+    ]
+
+    def esc(v):
+        return str(v).replace(""'"", ""''"")
+
+    # Date range applied to completion date (projects considered complete)
+    if filters.get(""start_date""):
+        where_parts.append(f""ms_1555_construction_complete_actual::date >= '{esc(filters['start_date'])}'"")
+    if filters.get(""end_date""):
+        where_parts.append(f""ms_1555_construction_complete_actual::date <= '{esc(filters['end_date'])}'"")
+
+    # Optional dimensional filters
+    for col in [
+        ""pj_project_id"",
+        ""s_site_id"",
+        ""rgn_region"",
+        ""m_area"",
+        ""m_market"",
+        ""pj_general_contractor"",
+        ""por_category"",
+        ""s_site_class""
+    ]:
+        if filters.get(col) is not None:
+            where_parts.append(f""{col} = '{esc(filters[col])}'"")
+
+    where_sql = "" AND "".join(where_parts)
+
+    sql = f""""""
+    WITH base AS (
+      SELECT
+        pj_project_id,
+        rgn_region,
+        m_area,
+        m_market,
+        pj_general_contractor,
+        por_category,
+        s_site_class,
+        (ms_1555_construction_complete_actual::date - ms_1550_construction_start_actual::date) AS cx_cycle_days
+      FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined
+      WHERE {where_sql}
+    ),
+    grouped AS (
+      SELECT
+        rgn_region,
+        m_area,
+        m_market,
+        pj_general_contractor,
+        por_category,
+        s_site_class,
+        COUNT(*)::int AS project_count,
+        AVG(cx_cycle_days)::float AS avg_cx_cycle_days,
+        PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY cx_cycle_days) AS p50_cx_cycle_days,
+        PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY cx_cycle_days) AS p90_cx_cycle_days,
+        MAX(cx_cycle_days)::int AS max_cx_cycle_days
+      FROM base
+      GROUP BY 1,2,3,4,5,6
+    )
+    SELECT
+      rgn_region,
+      m_area,
+      m_market,
+      pj_general_contractor,
+      por_category,
+      s_site_class,
+      project_count,
+      avg_cx_cycle_days,
+      p50_cx_cycle_days,
+      p90_cx_cycle_days,
+      max_cx_cycle_days
+    FROM grouped
+    ORDER BY rgn_region, m_area, m_market, pj_general_contractor, por_category, s_site_class
+    """"""
+
+    rows = execute_query(sql)
+
+    # If por_category and/or s_site_class are not desired for a particular pwc_macro_staging_schemaation,
+    # caller can ignore them; to support ""optional slices"" behavior, we keep them nullable.
+    return rows
+",NTM/AHLOA,"        m_market AS market,","A4225-A5175(preferred this as this is for magenta) 
+or 1550-1555",A4225-A5175 or 1550-1555,,,
+ CPO to Cx Start,"kpi_python_function: def get_cpo_to_cx_start(execute_query, filters=None) -> list[dict]:
+    """"""CPO to Cx Start cycle time (days).
+
+    Preferred CPO source (production intent): confirm_receipt_of_base_pos_and_spos_generated.
+    Active implementation (until preferred column is populated): pj_a_4200_pull_construction_po_number_finish (MS 4200).
+
+    Cycle time (days) = ms_1550_construction_start_actual::date - pj_a_4200_pull_construction_po_number_finish::date.
+
+    Returns grouped rollups with average, median (P50), and P90 across projects.
+    Group-by dimensions: rgn_region, m_area, m_market, pj_general_contractor, por_regional_dev_initiatives.
+
+    Optional filters supported (exact-match):
+      - rgn_region, m_area, m_market, pj_general_contractor, por_regional_dev_initiatives
+      - pj_project_id, s_site_id
+      - start_date, end_date (applies to ms_1550_construction_start_actual)
+    """"""
+
+    filters = filters or {}
+
+    def _to_date_str(v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s:
+            return None
+        return s[:10]
+
+    where_parts = []
+
+    # Dimension filters ONLY
+    for k in [
+        ""rgn_region"",
+        ""m_area"",
+        ""m_market"",
+        ""pj_general_contractor"",
+        ""por_regional_dev_initiatives"",
+        ""pj_project_id"",
+        ""s_site_id"",
+    ]:
+        if filters.get(k) is not None and str(filters.get(k)).strip() != """":
+            escaped = str(filters[k]).replace(""'"", ""''"")
+            where_parts.append(f""{k} = '{escaped}'"")
+
+    # Date range filter: apply to end milestone (construction start actual)
+    start_date = _to_date_str(filters.get(""start_date""))
+    end_date = _to_date_str(filters.get(""end_date""))
+    if start_date:
+        where_parts.append(f""ms_1550_construction_start_actual::date >= '{start_date}'::date"")
+    if end_date:
+        where_parts.append(f""ms_1550_construction_start_actual::date <= '{end_date}'::date"")
+
+    additional_where = """"
+    if where_parts:
+        additional_where = "" AND "" + "" AND "".join(where_parts)
+
+    sql = f""""""
+        SELECT
+            rgn_region,
+            m_area,
+            m_market,
+            pj_general_contractor,
+            por_regional_dev_initiatives,
+            COUNT(DISTINCT pj_project_id) AS project_count,
+            AVG(cycle_time_days::numeric) AS avg_cycle_time_days,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cycle_time_days) AS median_p50_cycle_time_days,
+            PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY cycle_time_days) AS p90_cycle_time_days
+        FROM (
+            SELECT
+                pj_project_id,
+                rgn_region,
+                m_area,
+                m_market,
+                pj_general_contractor,
+                por_regional_dev_initiatives,
+                (ms_1550_construction_start_actual::date - pj_a_4200_pull_construction_po_number_finish::date) AS cycle_time_days
+            FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined
+            WHERE ms_1550_construction_start_actual IS NOT NULL
+              AND pj_a_4200_pull_construction_po_number_finish IS NOT NULL
+              AND (ms_1550_construction_start_actual::date - pj_a_4200_pull_construction_po_number_finish::date) >= 0
+              {additional_where}
+        ) sub
+        GROUP BY 1,2,3,4,5
+        ORDER BY 1,2,3,4,5
+    """"""
+
+    return execute_query(sql)
+",NTM/AHLOA,"        COALESCE(construction_gc, pj_general_contractor) AS gc,","ms_1555_construction_complete_cpo_custom_field
+ms_1550_construction_start_actual","ms1555_construction_complete_so_header
+ms_1550_construction_start_actual",,,
+ HSE Daily Compliance Rate,"kpi_python_function: def get_hse_daily_compliance_rate(execute_query, filters=None) -> list[dict]:
+    """"""Grain: one row per (region, market, gc_name, gsd_hse_review_check_date::date).
+
+    Computes attempted vs compliant distinct sites and failure-gate distinct-site counts.
+    """"""
+
+    def _esc(v):
+        return str(v).replace(""'"", ""''"")
+
+    # Build WHERE clause (PostgreSQL)
+    where_parts = []
+
+    # Date filtering: apply to gsd_hse_review_check_date
+    if filters:
+        start_date = filters.get(""start_date"")
+        end_date = filters.get(""end_date"")
+        if start_date:
+            where_parts.append(f""gsd_hse_review_check_date >= '{_esc(start_date)}'"")
+        if end_date:
+            where_parts.append(
+                f""gsd_hse_review_check_date < ('{_esc(end_date)}'::date + interval '1 day')""
+            )
+
+        # Optional dimension filters (only if provided)
+        for k in [
+            ""region"",
+            ""market"",
+            ""gc_name"",
+            ""site_id"",
+            ""customer_name"",
+            ""hse_status"",
+            ""non_compliance_status"",
+            ""hse_engineer_name"",
+            ""smp_id"",
+            ""smp_name"",
+        ]:
+            if k in filters and filters.get(k) is not None and filters.get(k) != """":
+                where_parts.append(f""{k} = '{_esc(filters.get(k))}'"")
+
+    where_parts.append(""gsd_hse_review_check_date IS NOT NULL"")
+
+    where_sql = """"
+    if where_parts:
+        where_sql = ""WHERE "" + "" AND "".join(where_parts)
+
+    # NOTE: ""each_crew_ptid_I2w_status"" is a physically-cased column name; must be double-quoted in Postgres.
+    sql = f""""""
+        SELECT
+            region,
+            market,
+            gc_name,
+            (gsd_hse_review_check_date::date) AS gsd_hse_review_check_date,
+
+            COUNT(DISTINCT CASE
+                WHEN gsd_hse_review_check_date IS NOT NULL
+                 AND check_in_status IS NOT NULL
+                THEN site_id
+            END) AS attempted_reviews,
+
+            COUNT(DISTINCT CASE
+                WHEN gsd_hse_review_check_date IS NOT NULL
+                 AND check_in_status IS NOT NULL
+                 AND check_in_status IN ('Done','Checked In')
+                 AND ppe_validation = 'Pass'
+                 AND jsa_completion_status = 'Completed'
+                 AND ""each_crew_ptid_I2w_status"" = 'Available'
+                THEN site_id
+            END) AS compliant_reviews,
+
+            (100.0 *
+                COUNT(DISTINCT CASE
+                    WHEN gsd_hse_review_check_date IS NOT NULL
+                     AND check_in_status IS NOT NULL
+                     AND check_in_status IN ('Done','Checked In')
+                     AND ppe_validation = 'Pass'
+                     AND jsa_completion_status = 'Completed'
+                     AND ""each_crew_ptid_I2w_status"" = 'Available'
+                    THEN site_id
+                END)
+             / NULLIF(
+                COUNT(DISTINCT CASE
+                    WHEN gsd_hse_review_check_date IS NOT NULL
+                     AND check_in_status IS NOT NULL
+                    THEN site_id
+                END)
+             , 0)
+            ) AS compliance_rate_pct,
+
+            COUNT(DISTINCT CASE
+                WHEN gsd_hse_review_check_date IS NOT NULL
+                 AND check_in_status IS NOT NULL
+                 AND (check_in_status NOT IN ('Done','Checked In') OR check_in_status IS NULL)
+                THEN site_id
+            END) AS fail_check_in_count,
+
+            COUNT(DISTINCT CASE
+                WHEN gsd_hse_review_check_date IS NOT NULL
+                 AND check_in_status IS NOT NULL
+                 AND (ppe_validation IS DISTINCT FROM 'Pass')
+                THEN site_id
+            END) AS fail_ppe_count,
+
+            COUNT(DISTINCT CASE
+                WHEN gsd_hse_review_check_date IS NOT NULL
+                 AND check_in_status IS NOT NULL
+                 AND (jsa_completion_status IS DISTINCT FROM 'Completed')
+                THEN site_id
+            END) AS fail_jsa_count,
+
+            COUNT(DISTINCT CASE
+                WHEN gsd_hse_review_check_date IS NOT NULL
+                 AND check_in_status IS NOT NULL
+                 AND (""each_crew_ptid_I2w_status"" IS DISTINCT FROM 'Available')
+                THEN site_id
+            END) AS fail_ptid_i2w_count,
+
+            COUNT(DISTINCT CASE
+                WHEN gsd_hse_review_check_date IS NOT NULL
+                 AND check_in_status IS NOT NULL
+                 AND NOT (
+                    check_in_status IN ('Done','Checked In')
+                    AND ppe_validation = 'Pass'
+                    AND jsa_completion_status = 'Completed'
+                    AND ""each_crew_ptid_I2w_status"" = 'Available'
+                 )
+                THEN site_id
+            END) AS any_non_compliant_count
+
+        FROM pwc_macro_staging_schema.stg_ndpd_hse_site_checklist
+        {where_sql}
+        GROUP BY
+            region,
+            market,
+            gc_name,
+            (gsd_hse_review_check_date::date)
+        ORDER BY
+            region,
+            market,
+            gc_name,
+            (gsd_hse_review_check_date::date)
+    """"""
+
+    return execute_query(sql, db=""pwc_macro_staging_schema"")
+",NTM/AHLOA,"        pj_project_id,","SMP_ID mapped to Combined Table, then filter SMP Name=""AHLOB Mordenization""","SMP_ID mapped to COmbined Table, then filter SMP Name",,,"As there is no smp_name in hse_checklist table need to JOIN 
+on smp_id and then filter on smp_name from combined table"
+ CX to On-Air Backlog,,NTM/AHLOA,,ms_1970- Blank && 1555 - Non blank is backlog,ms_1970- Blank && 1555 - Non blank is backlog,,,
+ Pending MW Acceptance,"kpi_python_function: def get_pending_mw_acceptance(execute_query, filters=None) -> list[dict]:
+    """"""Counts distinct projects pending MW link final acceptance.
+
+    Definition:
+      MW installation complete date is NOT NULL
+      AND MW link final accepted/operational date is NULL
+      KPI = COUNT(DISTINCT pj_project_id)
+
+    Groupable by: rgn_region, m_area, m_market; optionally pj_general_contractor, por_regional_dev_initiatives.
+
+    Notes:
+      The Tier-1 get_project accessor does not expose the two MW milestone columns, so we use raw SQL.
+    """"""
+
+    filters = filters or {}
+
+    # Dimensions to group by
+    group_by = filters.get(""group_by"")
+    if not group_by:
+        group_by_cols = [""rgn_region"", ""m_area"", ""m_market""]
+    else:
+        if isinstance(group_by, str):
+            group_by_cols = [c.strip() for c in group_by.split("","") if c.strip()]
+        else:
+            group_by_cols = [str(c).strip() for c in group_by if str(c).strip()]
+
+    # Allowlist group-by columns for safety
+    allowed_group_bys = {
+        ""rgn_region"",
+        ""m_area"",
+        ""m_market"",
+        ""pj_general_contractor"",
+        ""por_regional_dev_initiatives"",
+        ""pj_program_name""
+    }
+    group_by_cols = [c for c in group_by_cols if c in allowed_group_bys]
+    if not group_by_cols:
+        group_by_cols = [""rgn_region"", ""m_area"", ""m_market""]
+
+    select_dims = "", "".join(group_by_cols)
+    group_by_sql = "", "".join(group_by_cols)
+
+    where_parts = [
+        ""pj_a_4425_mw_installation_complete_finish IS NOT NULL"",
+        ""pj_a_5300_mw_link_final_accepted_and_operational_finish IS NULL""
+    ]
+
+    # Optional filters
+    # (No explicit date filtering since KPI definition is based on milestone null-ness;
+    #  but allow slicing by region/area/market/gc/program/project/site if provided.)
+    allowed_filters = {
+        ""rgn_region"",
+        ""m_area"",
+        ""m_market"",
+        ""pj_general_contractor"",
+        ""por_regional_dev_initiatives"",
+        ""pj_program_name"",
+        ""pj_project_id"",
+        ""s_site_id""
+    }
+    for k, v in (filters or {}).items():
+        if k in (""group_by"", ""start_date"", ""end_date""):
+            continue
+        if k not in allowed_filters:
+            continue
+        if v is None or v == """":
+            continue
+        escaped = str(v).replace(""'"", ""''"")
+        where_parts.append(f""{k} = '{escaped}'"")
+
+    where_sql = "" AND "".join(where_parts)
+
+    sql = (
+        ""SELECT ""
+        f""{select_dims}, ""
+        ""COUNT(DISTINCT pj_project_id) AS pending_mw_acceptance_count ""
+        ""FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined ""
+        f""WHERE {where_sql} ""
+        f""GROUP BY {group_by_sql} ""
+        f""ORDER BY {group_by_sql}""
+    )
+
+    rows = execute_query(sql)
+    return rows
+",NTM/AHLOA,        -- Construction start date,Looks good.. use only SMp name filter.. ,Looks good.. use only SMp name filter.. ,,,
+ Weekly GC Run Rate,"kpi_python_function: def get_weekly_gc_run_rate(execute_query, filters=None) -> list[dict]:
+    """"""Trailing-12-week observed construction completion throughput per (region, area, market, GC).
+
+    Definition (per spec):
+      - Include only projects where ms_1555_construction_complete_actual is not null
+      - And ms_1555_construction_complete_actual::date >= CURRENT_DATE - INTERVAL '84 days'
+      - Run rate = COUNT(DISTINCT pj_project_id) / 12
+      - Anchored to CURRENT_DATE (snapshot)
+
+    Optional filters supported (if provided): rgn_region, m_area, m_market, pj_general_contractor, start_date, end_date.
+      - start_date/end_date override the trailing window if both provided; otherwise trailing window is used.
+    """"""
+
+    filters = filters or {}
+
+    # Prefer raw SQL here because Tier-1 accessors do not expose ms_1555_construction_complete_actual,
+    # and pushing date filtering/distinct counting to the DB avoids full-table pulls.
+
+    where_parts = [
+        ""ms_1555_construction_complete_actual IS NOT NULL""
+    ]
+
+    # Window handling
+    start_date = filters.get(""start_date"")
+    end_date = filters.get(""end_date"")
+    if start_date and end_date:
+        sd = str(start_date).replace(""'"", ""''"")
+        ed = str(end_date).replace(""'"", ""''"")
+        where_parts.append(f""ms_1555_construction_complete_actual::date >= '{sd}'::date"")
+        where_parts.append(f""ms_1555_construction_complete_actual::date <= '{ed}'::date"")
+    else:
+        where_parts.append(""ms_1555_construction_complete_actual::date >= (CURRENT_DATE - INTERVAL '84 days')"")
+        where_parts.append(""ms_1555_construction_complete_actual::date <= CURRENT_DATE"")
+
+    # Dimensional filters
+    for col in (""rgn_region"", ""m_area"", ""m_market"", ""pj_general_contractor""):
+        if filters.get(col) is not None and filters.get(col) != """":
+            val = str(filters[col]).replace(""'"", ""''"")
+            where_parts.append(f""{col} = '{val}'"")
+
+    where_sql = "" AND "".join(where_parts)
+
+    sql = f""""""
+        WITH base AS (
+            SELECT
+                rgn_region,
+                m_area,
+                m_market,
+                pj_general_contractor,
+                pj_project_id,
+                date_trunc('week', ms_1555_construction_complete_actual::date)::date AS completion_week
+            FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined
+            WHERE {where_sql}
+        ),
+        agg AS (
+            SELECT
+                rgn_region,
+                m_area,
+                m_market,
+                pj_general_contractor,
+                COUNT(DISTINCT pj_project_id) AS completed_projects_12w
+            FROM base
+            GROUP BY 1,2,3,4
+        )
+        SELECT
+            rgn_region,
+            m_area,
+            m_market,
+            pj_general_contractor,
+            completed_projects_12w,
+            (completed_projects_12w::numeric / 12.0) AS weekly_gc_run_rate
+        FROM agg
+        ORDER BY rgn_region, m_area, m_market, pj_general_contractor
+    """"""
+
+    rows = execute_query(sql)
+
+    # Ensure numeric stability in Python (and provide explicit 0s if any nulls slip through)
+    out = []
+    for r in rows:
+        completed = r.get(""completed_projects_12w"") or 0
+        run_rate = r.get(""weekly_gc_run_rate"")
+        if run_rate is None:
+            run_rate = float(completed) / 12.0
+        out.append({
+            ""rgn_region"": r.get(""rgn_region""),
+            ""m_area"": r.get(""m_area""),
+            ""m_market"": r.get(""m_market""),
+            ""pj_general_contractor"": r.get(""pj_general_contractor""),
+            ""completed_projects_12w"": int(completed),
+            ""weekly_gc_run_rate"": float(run_rate)
+        })
+
+    return out
+",NTM/AHLOA,"        TRY_TO_DATE(pj_a_4225_construction_start_finish) AS construction_start_date,",Runrate should refer A5175 or 1555,Runrate should refer A5175 or 1555,,,
+ Civil Cycle Time,"kpi_python_function: def get_civil_cycle_time(execute_query, filters=None) -> list[dict]:
+    """"""Civil Cycle Time (calendar days) for split-scope/civil-confirmed sites.
+
+    Returns one row per grouping with avg/median/p90/max/count of civil cycle days.
+
+    Expected optional filters keys (all optional):
+      - start_date, end_date: applied to ms_1549_civil_construction_start_actual (date)
+      - rgn_region, m_area, m_market, pj_general_contractor
+      - por_category, s_site_class
+
+    Notes:
+      - Uses raw SQL because the needed civil milestone columns are not exposed by Tier-1 accessors.
+      - Postgres date math: (complete_date::date - start_date::date) yields integer days.
+    """"""
+
+    filters = filters or {}
+
+    def _esc(v):
+        return str(v).replace(""'"", ""''"")
+
+    where_parts = [
+        ""confirm_split_spo IS NOT NULL"",
+        ""ms_1549_civil_construction_start_actual IS NOT NULL"",
+        ""ms_1551_civil_construction_complete_actual_date IS NOT NULL"",
+        ""(ms_1551_civil_construction_complete_actual_date::date - ms_1549_civil_construction_start_actual::date) >= 0""
+    ]
+
+    # Date range filter on START date (common operational interpretation)
+    if filters.get(""start_date""):
+        where_parts.append(f""ms_1549_civil_construction_start_actual::date >= '{_esc(filters['start_date'])}'"")
+    if filters.get(""end_date""):
+        where_parts.append(f""ms_1549_civil_construction_start_actual::date <= '{_esc(filters['end_date'])}'"")
+
+    # Dimension filters
+    dim_filter_keys = [
+        ""rgn_region"",
+        ""m_area"",
+        ""m_market"",
+        ""pj_general_contractor"",
+        ""por_category"",
+        ""s_site_class""
+    ]
+    for k in dim_filter_keys:
+        if filters.get(k) is not None and filters.get(k) != """":
+            where_parts.append(f""{k} = '{_esc(filters[k])}'"")
+
+    where_sql = "" AND "".join(where_parts)
+
+    # Group-by dimensions (mandatory set + optional)
+    group_dims = [""rgn_region"", ""m_area"", ""m_market"", ""pj_general_contractor""]
+    optional_dims = []
+    if filters.get(""group_by_por_category""):
+        optional_dims.append(""por_category"")
+    if filters.get(""group_by_site_class""):
+        optional_dims.append(""s_site_class"")
+
+    group_dims_all = group_dims + optional_dims
+
+    select_dims_sql = "", "".join(group_dims_all) if group_dims_all else """"
+    group_by_sql = f""GROUP BY {', '.join(group_dims_all)}"" if group_dims_all else """"
+    order_by_sql = f""ORDER BY {', '.join(group_dims_all)}"" if group_dims_all else """"
+
+    if select_dims_sql:
+        select_prefix = select_dims_sql + "",\n       ""
+    else:
+        select_prefix = """"
+
+    sql = f""""""
+WITH base AS (
+  SELECT
+    rgn_region,
+    m_area,
+    m_market,
+    pj_general_contractor,
+    por_category,
+    s_site_class,
+    (ms_1551_civil_construction_complete_actual_date::date - ms_1549_civil_construction_start_actual::date) AS civil_cycle_days
+  FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined
+  WHERE {where_sql}
+)
+SELECT
+       {select_prefix}COUNT(*) AS project_count,
+       AVG(civil_cycle_days)::numeric(18,2) AS avg_civil_cycle_days,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY civil_cycle_days) AS median_p50_civil_cycle_days,
+       percentile_cont(0.9) WITHIN GROUP (ORDER BY civil_cycle_days) AS p90_civil_cycle_days,
+       MAX(civil_cycle_days) AS max_civil_cycle_days
+FROM base
+{group_by_sql}
+{order_by_sql}
+"""""".strip()
+
+    return execute_query(sql)
+",NTM/AHLOA,,A4250 - A4750 (Magenta) or 1549 - 1551 (NDPd),A4250 - A4750 (Magenta) or 1549 - 1551 (NDPd),,,
+ Prereq Readiness Rate,"kpi_python_function: def get_prereq_readiness_rate(execute_query, filters=None) -> list[dict]:
+    """"""Prereq Readiness Rate (%): among active pipeline (not yet started construction) projects,
+    percent that meet baseline readiness gates (NTP, material pickup, power ready, backhaul ready).
+
+    Returns rows grouped by: rgn_region, m_area, m_market, pj_general_contractor, por_category (if present).
+
+    Supported filters (optional):
+      - rgn_region, m_area, m_market, pj_general_contractor, por_category
+      - pj_project_id, s_site_id
+      - enable_scoping_validated_denominator (bool): if truthy, adds ms_1327_scoping_and_quoting_package_validated_actual IS NOT NULL to denominator
+      - enable_soft_power_gate (bool): if truthy, power gate is (pj_a_4525_power_ready_finish IS NOT NULL OR pj_a_4450_permanent_power_ordered_finish IS NOT NULL)
+
+    Note: Data source is pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined only (no joins).
+    """"""
+
+    filters = filters or {}
+
+    enable_scoping_validated_denominator = bool(filters.pop(""enable_scoping_validated_denominator"", False))
+    enable_soft_power_gate = bool(filters.pop(""enable_soft_power_gate"", False))
+
+    where_parts = []
+    where_parts.append(""t.\""pj_project_status\"" = 'Active'"")
+    where_parts.append(""t.\""ms_1550_construction_start_actual\"" IS NULL"")
+
+    if enable_scoping_validated_denominator:
+        where_parts.append(""t.\""ms_1327_scoping_and_quoting_package_validated_actual\"" IS NOT NULL"")
+
+    for k, v in list(filters.items()):
+        if v is None:
+            continue
+        escaped = str(v).replace(""'"", ""''"")
+        if k in {
+            ""rgn_region"",
+            ""m_area"",
+            ""m_market"",
+            ""pj_general_contractor"",
+            ""por_category"",
+            ""pj_project_id"",
+            ""s_site_id"",
+        }:
+            where_parts.append(f""t.\""{k}\"" = '{escaped}'"")
+
+    where_sql = "" AND "".join(where_parts)
+
+    ntp_gate = ""(t.\""ms_1507_tower_ntp_approved_actual\"" IS NOT NULL OR t.\""pj_a_4100_construction_ntp_accepted_by_gc_finish\"" IS NOT NULL)""
+
+    # Physical column name is mixed-case in Postgres; must be double-quoted exactly.
+    material_gate = '(t.""pj_a_3925_msl_pickup_date_finish"" IS NOT NULL)'
+
+    if enable_soft_power_gate:
+        power_gate = ""(t.\""pj_a_4525_power_ready_finish\"" IS NOT NULL OR t.\""pj_a_4450_permanent_power_ordered_finish\"" IS NOT NULL)""
+    else:
+        power_gate = ""(t.\""pj_a_4525_power_ready_finish\"" IS NOT NULL)""
+
+    backhaul_gate = ""(t.\""pj_a_4925_aav_fiber_ready_finish\"" IS NOT NULL OR t.\""pj_a_4425_mw_installation_complete_finish\"" IS NOT NULL)""
+
+    readiness_all_gates = f""({ntp_gate} AND {material_gate} AND {power_gate} AND {backhaul_gate})""
+
+    group_cols = [
+        ""t.\""rgn_region\"""",
+        ""t.\""m_area\"""",
+        ""t.\""m_market\"""",
+        ""t.\""pj_general_contractor\"""",
+        ""t.\""por_category\"""",
+    ]
+
+    select_group_cols = "", "".join(group_cols)
+    group_by_sql = "", "".join(group_cols)
+
+    sql = f""""""
+        SELECT
+            {select_group_cols},
+            COUNT(DISTINCT t.\""pj_project_id\"") AS denominator_pipeline_wip,
+            COUNT(DISTINCT CASE WHEN {readiness_all_gates} THEN t.\""pj_project_id\"" ELSE NULL END) AS numerator_ready_to_start,
+            (100.0 * COUNT(DISTINCT CASE WHEN {readiness_all_gates} THEN t.\""pj_project_id\"" ELSE NULL END)
+                  / NULLIF(COUNT(DISTINCT t.\""pj_project_id\""), 0)) AS prereq_readiness_rate
+        FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined AS t
+        WHERE {where_sql}
+        GROUP BY {group_by_sql}
+    """""".strip()
+
+    return execute_query(sql, db=None, max_rows=None)
+",NTM/AHLOA,        -- Earliest ON-AIR date across all onair_finish columns,Connect with Talib/Aniruddha for Prerequisites.. we have long list to follow for both category,Connect with Talib/Aniruddha for Prerequisites.. we have long list to follow for both category,,,
+ Prereq Readiness Strict,"kpi_python_function: def get_prereq_readiness_strict(execute_query, filters=None) -> list[dict]:
+    """"""Prereq Readiness Strict (%) grouped by region/area/market/GC.
+
+    Source: pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined (no joins).
+
+    Denominator (Active, construction not started):
+      - pj_project_status = 'Active'
+      - ms_1550_construction_start_actual IS NULL
+
+    Numerator: Denominator + all prerequisite gates met:
+      - NTP cleared:
+          ms_1507_tower_ntp_approved_actual IS NOT NULL
+          OR pj_a_4100_construction_ntp_accepted_by_gc_finish IS NOT NULL
+      - Material pickup: pj_a_3925_msl_pickup_date_finish IS NOT NULL
+      - Power ready: pj_a_4525_power_ready_finish IS NOT NULL
+      - Backhaul ready:
+          pj_a_4925_aav_fiber_ready_finish IS NOT NULL
+          OR pj_a_4425_mw_installation_complete_finish IS NOT NULL
+      - Site access (strict): pj_a_3825_pre_construction_walk_complete_finish IS NOT NULL
+
+    KPI = 100 * numerator / denominator
+    """"""
+
+    filters = filters or {}
+
+    # Fixed, verified physical column predicates (no placeholders)
+    denom_pred = ""(pj_project_status = 'Active' AND ms_1550_construction_start_actual IS NULL)""
+
+    ntp_pred = ""(ms_1507_tower_ntp_approved_actual IS NOT NULL OR pj_a_4100_construction_ntp_accepted_by_gc_finish IS NOT NULL)""
+    material_pred = ""(pj_a_3925_msl_pickup_date_finish IS NOT NULL)""
+    power_pred = ""(pj_a_4525_power_ready_finish IS NOT NULL)""
+    backhaul_pred = ""(pj_a_4925_aav_fiber_ready_finish IS NOT NULL OR pj_a_4425_mw_installation_complete_finish IS NOT NULL)""
+    site_access_pred = ""(pj_a_3825_pre_construction_walk_complete_finish IS NOT NULL)""
+
+    num_pred = "" AND "".join([
+        denom_pred,
+        ntp_pred,
+        material_pred,
+        power_pred,
+        backhaul_pred,
+        site_access_pred,
+    ])
+
+    # Grouping (fixed as requested)
+    group_dims = [""rgn_region"", ""m_area"", ""m_market"", ""pj_general_contractor""]
+
+    # Optional dimension filters (exact-match)
+    where_parts = []
+    if filters.get(""rgn_region"") is not None:
+        v = str(filters.get(""rgn_region"")).replace(""'"", ""''"")
+        where_parts.append(f""rgn_region = '{v}'"")
+    if filters.get(""m_area"") is not None:
+        v = str(filters.get(""m_area"")).replace(""'"", ""''"")
+        where_parts.append(f""m_area = '{v}'"")
+    if filters.get(""m_market"") is not None:
+        v = str(filters.get(""m_market"")).replace(""'"", ""''"")
+        where_parts.append(f""m_market = '{v}'"")
+    if filters.get(""pj_general_contractor"") is not None:
+        v = str(filters.get(""pj_general_contractor"")).replace(""'"", ""''"")
+        where_parts.append(f""pj_general_contractor = '{v}'"")
+
+    where_clause = """"
+    if where_parts:
+        where_clause = ""WHERE "" + "" AND "".join(where_parts)
+
+    group_by = "", "".join(group_dims)
+    select_dims = "", "".join(group_dims)
+
+    sql = f""""""
+        SELECT
+            {select_dims},
+            COUNT(DISTINCT CASE WHEN {denom_pred} THEN pj_project_id END) AS denominator,
+            COUNT(DISTINCT CASE WHEN {num_pred} THEN pj_project_id END) AS numerator,
+            100.0 * COUNT(DISTINCT CASE WHEN {num_pred} THEN pj_project_id END)
+                / NULLIF(COUNT(DISTINCT CASE WHEN {denom_pred} THEN pj_project_id END), 0) AS kpi_value
+        FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined
+        {where_clause}
+        GROUP BY {group_by}
+        ORDER BY {group_by}
+    """""".strip()
+
+    rows = execute_query(sql)
+
+    out = []
+    for r in rows:
+        rec = {k: r.get(k) for k in group_dims}
+        rec[""denominator""] = r.get(""denominator"")
+        rec[""numerator""] = r.get(""numerator"")
+        rec[""kpi_value""] = r.get(""kpi_value"")
+        out.append(rec)
+    return out
+",NTM/AHLOA,        LEAST(,Connect with Talib/Aniruddha for Prerequisites.. we have long list to follow for both category,Connect with Talib/Aniruddha for Prerequisites.. we have long list to follow for both category,,,
+ CX to On-Air Lead Time,"kpi_python_function: def get_cx_to_on_air_lead_time(execute_query, filters=None) -> list[dict]:
+    """"""CX to On-Air Lead Time distribution by (rgn_region, m_area, m_market, pj_general_contractor).
+
+    Lead time (calendar days) = (pj_completion_objective_actual_date::date - ms_1555_construction_complete_actual::date)
+    where both dates are not null and diff >= 0.
+
+    Returns list of dicts with avg_days, p50_days, p90_days, max_days, n.
+    """"""
+
+    filters = filters or {}
+
+    def _escape(v):
+        return str(v).replace(""'"", ""''"")
+
+    # Build WHERE clause from provided filters.
+    # Note: start/end_date are applied to pj_completion_objective_actual_date (On-Air) by default.
+    where_parts = [
+        ""pj_completion_objective_actual_date IS NOT NULL"",
+        ""ms_1555_construction_complete_actual IS NOT NULL"",
+        ""(pj_completion_objective_actual_date::date - ms_1555_construction_complete_actual::date) >= 0""
+    ]
+
+    # Common dimensional filters
+    passthrough_keys = [
+        ""rgn_region"",
+        ""m_area"",
+        ""m_market"",
+        ""pj_general_contractor"",
+        ""pj_project_id"",
+        ""s_site_id"",
+        ""pj_project_status"",
+        ""pj_project_type"",
+        ""pj_program_name""
+    ]
+    for k in passthrough_keys:
+        if k in filters and filters.get(k) is not None and filters.get(k) != """":
+            where_parts.append(f""{k} = '{_escape(filters.get(k))}'"")
+
+    start_date = filters.get(""start_date"")
+    end_date = filters.get(""end_date"")
+    if start_date:
+        where_parts.append(f""pj_completion_objective_actual_date::date >= '{_escape(start_date)}'::date"")
+    if end_date:
+        where_parts.append(f""pj_completion_objective_actual_date::date <= '{_escape(end_date)}'::date"")
+
+    where_sql = "" WHERE "" + "" AND "".join(where_parts)
+
+    # Use raw SQL (preferred here) because required columns are not exposed by Tier-1 accessors,
+    # and we need percentiles efficiently.
+    sql = (
+        ""SELECT ""
+        ""  rgn_region, ""
+        ""  m_area, ""
+        ""  m_market, ""
+        ""  pj_general_contractor, ""
+        ""  COUNT(*) AS n, ""
+        ""  AVG((pj_completion_objective_actual_date::date - ms_1555_construction_complete_actual::date))::double precision AS avg_days, ""
+        ""  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY (pj_completion_objective_actual_date::date - ms_1555_construction_complete_actual::date))::double precision AS p50_days, ""
+        ""  PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY (pj_completion_objective_actual_date::date - ms_1555_construction_complete_actual::date))::double precision AS p90_days, ""
+        ""  MAX((pj_completion_objective_actual_date::date - ms_1555_construction_complete_actual::date))::double precision AS max_days ""
+        ""FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined""
+        + where_sql +
+        "" GROUP BY rgn_region, m_area, m_market, pj_general_contractor ""
+        "" ORDER BY rgn_region, m_area, m_market, pj_general_contractor""
+    )
+
+    return execute_query(sql)
+",NTM/AHLOA,"            TRY_TO_DATE(pj_a_onair_finish),",same as On-Air Cycle time,same as On-Air Cycle time,,,
+ Ready Site Backlog,"kpi_python_function: def get_ready_site_backlog(execute_query, filters=None) -> list[dict]:
+    """"""Counts ready-but-not-started projects per (rgn_region, m_area, m_market, pj_general_contractor) as-of CURRENT_DATE.
+
+    Demand definition:
+      COUNT(DISTINCT pj_project_id)
+      WHERE ms_1550_construction_start_actual IS NULL
+        AND NTP cleared
+        AND material picked up
+        AND power ready
+        AND backhaul ready
+
+    Notes:
+      - Uses raw SQL because readiness gates require milestone/date columns that are not exposed by Tier-1 accessors.
+      - Filters are applied as additional WHERE predicates when provided.
+    """"""
+
+    filters = filters or {}
+
+    def _esc(v):
+        return str(v).replace(""'"", ""''"")
+
+    # Only allow filters that can be applied to this KPI query.
+    allowed_filter_cols = {
+        ""rgn_region"",
+        ""m_area"",
+        ""m_market"",
+        ""pj_general_contractor"",
+        ""pj_project_id"",
+        ""s_site_id"",
+        ""pj_program_name"",
+        ""pj_project_status"",
+        ""pj_project_type"",
+    }
+
+    where_parts = []
+
+    # Optional entity filters
+    for k, v in filters.items():
+        if v is None:
+            continue
+        if k in (""start_date"", ""end_date""):
+            # This KPI is defined as a CURRENT_DATE snapshot; ignore date-range filters.
+            continue
+        if k not in allowed_filter_cols:
+            continue
+        where_parts.append(f""{k} = '{_esc(v)}'"")
+
+    # Base readiness logic
+    where_parts.append(""ms_1550_construction_start_actual IS NULL"")
+
+    # 1) NTP cleared
+    where_parts.append(""(ms_1507_tower_ntp_approved_actual IS NOT NULL OR pj_a_4100_construction_ntp_accepted_by_gc_finish IS NOT NULL)"")
+
+    # 2) Material picked up
+    where_parts.append('""pj_a_3925_msl_pickup_date_finish"" IS NOT NULL')
+
+    # 3) Power ready
+    where_parts.append(""pj_a_4525_power_ready_finish IS NOT NULL"")
+
+    # 4) Backhaul ready
+    where_parts.append(""(pj_a_4925_aav_fiber_ready_finish IS NOT NULL OR pj_a_4425_mw_installation_complete_finish IS NOT NULL)"")
+
+    where_sql = "" AND "".join(where_parts) if where_parts else ""TRUE""
+
+    sql = f""""""
+        SELECT
+            rgn_region,
+            m_area,
+            m_market,
+            pj_general_contractor,
+            COUNT(DISTINCT pj_project_id) AS ready_site_backlog
+        FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined
+        WHERE {where_sql}
+        GROUP BY rgn_region, m_area, m_market, pj_general_contractor
+        ORDER BY rgn_region, m_area, m_market, pj_general_contractor
+    """""".strip()
+
+    return execute_query(sql)
+",NTM/AHLOA,"            TRY_TO_DATE(pj_b_onair_finish),",Connect with Talib/Aniruddha for Prerequisites.. we have long list to follow for both category,Connect with Talib/Aniruddha for Prerequisites.. we have long list to follow for both category,,,
+ Weekly GC Run Rate,"kpi_python_function: def get_weekly_gc_run_rate(execute_query, filters=None) -> list[dict]:
+    """"""Weekly GC Run Rate (sites/week) per (rgn_region, m_area, m_market, pj_general_contractor).
+
+    Definition:
+      COUNT(DISTINCT pj_project_id completed in trailing 12 weeks) / 12
+    Trailing 12 weeks window (relative to evaluation_date):
+      ms_1555_construction_complete_actual::date >= (evaluation_date - INTERVAL '84 days')
+      AND ms_1555_construction_complete_actual::date < (evaluation_date + INTERVAL '1 day')
+
+    Expected filters (optional):
+      - evaluation_date (YYYY-MM-DD). If not provided, uses CURRENT_DATE.
+      - rgn_region, m_area, m_market, pj_general_contractor, pj_project_id
+      - start_date/end_date are ignored for this KPI (window is defined via evaluation_date)
+
+    Returns list[dict] grouped by region/area/market/gc.
+    """"""
+
+    filters = filters or {}
+
+    eval_date = filters.get(""evaluation_date"") or filters.get(""as_of_date"") or filters.get(""date"")
+    if eval_date is None:
+        eval_date_sql = ""CURRENT_DATE""
+    else:
+        eval_date_escaped = str(eval_date).replace(""'"", ""''"")
+        eval_date_sql = f""DATE '{eval_date_escaped}'""
+
+    # Build additional WHERE clauses for dimension filtering (do NOT include evaluation_date)
+    where_parts = [
+        ""ms_1555_construction_complete_actual IS NOT NULL"",
+        f""(ms_1555_construction_complete_actual::date >= ({eval_date_sql} - INTERVAL '84 days'))"",
+        f""(ms_1555_construction_complete_actual::date < ({eval_date_sql} + INTERVAL '1 day'))"",
+    ]
+
+    allowed_dim_filters = {
+        ""rgn_region"": ""rgn_region"",
+        ""m_area"": ""m_area"",
+        ""m_market"": ""m_market"",
+        ""pj_general_contractor"": ""pj_general_contractor"",
+        ""pj_project_id"": ""pj_project_id"",
+    }
+
+    for fk, col in allowed_dim_filters.items():
+        if fk in filters and filters[fk] is not None and str(filters[fk]) != """":
+            v = str(filters[fk]).replace(""'"", ""''"")
+            where_parts.append(f""{col} = '{v}'"")
+
+    where_sql = "" AND "".join(where_parts)
+
+    # Raw SQL is used because the Tier-1 accessors do not expose ms_1555_construction_complete_actual
+    # and we need COUNT(DISTINCT ...) grouped with a date window.
+    sql = f""""""
+        SELECT
+            rgn_region,
+            m_area,
+            m_market,
+            pj_general_contractor,
+            (COUNT(DISTINCT pj_project_id)::numeric / 12.0) AS weekly_gc_run_rate,
+            COUNT(DISTINCT pj_project_id) AS completed_projects_trailing_12w
+        FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined
+        WHERE {where_sql}
+        GROUP BY rgn_region, m_area, m_market, pj_general_contractor
+    """""".strip()
+
+    rows = execute_query(sql)
+
+    # Normalize output types
+    out = []
+    for r in rows or []:
+        out.append({
+            ""rgn_region"": r.get(""rgn_region""),
+            ""m_area"": r.get(""m_area""),
+            ""m_market"": r.get(""m_market""),
+            ""pj_general_contractor"": r.get(""pj_general_contractor""),
+            ""weekly_gc_run_rate"": float(r.get(""weekly_gc_run_rate"")) if r.get(""weekly_gc_run_rate"") is not None else None,
+            ""completed_projects_trailing_12w"": int(r.get(""completed_projects_trailing_12w"")) if r.get(""completed_projects_trailing_12w"") is not None else 0,
+            ""evaluation_date"": str(eval_date) if eval_date is not None else None,
+        })
+
+    return out
+",NTM/AHLOA,"            TRY_TO_DATE(pj_c_onair_finish),",Runrate should refer A5175 or 1555 - GC level Data,Runrate should refer A5175 or 1555 - GC level Data,,,
+ CX to On-Air Backlog,"kpi_python_function: def get_cx_to_on_air_backlog(execute_query, filters=None) -> list[dict]:
+    """"""CX to On-Air Backlog (CURRENT_DATE snapshot).
+
+    Base population per group:
+      DISTINCT pj_project_id
+      where ms_1555_construction_complete_actual IS NOT NULL
+        AND pj_completion_objective_actual_date IS NULL
+
+    Output columns per group:
+      - total_cx_complete_not_on_air
+      - pending_integration_start
+      - pending_integration_complete
+      - pending_cop_approval
+      - pending_other
+
+    Note: Uses raw SQL because required milestone columns are not exposed by Tier-1 accessors.
+    """"""
+
+    filters = filters or {}
+
+    def _sql_str(v):
+        return str(v).replace(""'"", ""''"")
+
+    # Build optional WHERE predicates.
+    # We filter on the same table; allow common grouping filters and project identifiers.
+    allowed_filters = {
+        ""rgn_region"": ""rgn_region"",
+        ""m_area"": ""m_area"",
+        ""m_market"": ""m_market"",
+        ""pj_general_contractor"": ""pj_general_contractor"",
+        ""pj_project_id"": ""pj_project_id"",
+        ""s_site_id"": ""s_site_id""
+    }
+
+    where_parts = []
+
+    # Optional snapshot-as-of filter: treat the milestone dates as occurring on/before end_date.
+    # If end_date not supplied, we leave as a CURRENT state check (NULL vs NOT NULL).
+    end_date = filters.get(""end_date"")
+    if end_date:
+        ed = _sql_str(end_date)
+        where_parts.append(f""ms_1555_construction_complete_actual::date <= '{ed}'::date"")
+        # If a project has On-Air date after snapshot, it should still be in backlog at snapshot.
+        where_parts.append(f""(pj_completion_objective_actual_date IS NULL OR pj_completion_objective_actual_date::date > '{ed}'::date)"")
+
+    # Add simple equality filters
+    for k, col in allowed_filters.items():
+        if k in filters and filters[k] is not None and filters[k] != """":
+            where_parts.append(f""{col} = '{_sql_str(filters[k])}'"")
+
+    where_sql = (""WHERE "" + "" AND "".join(where_parts)) if where_parts else """"
+
+    sql = f""""""
+    SELECT
+      rgn_region,
+      m_area,
+      m_market,
+      pj_general_contractor,
+
+      COUNT(DISTINCT CASE
+        WHEN ms_1555_construction_complete_actual IS NOT NULL
+         AND pj_completion_objective_actual_date IS NULL
+        THEN pj_project_id END
+      ) AS total_cx_complete_not_on_air,
+
+      COUNT(DISTINCT CASE
+        WHEN ms_1555_construction_complete_actual IS NOT NULL
+         AND pj_completion_objective_actual_date IS NULL
+         AND pj_a_5270_integration_start_finish IS NULL
+        THEN pj_project_id END
+      ) AS pending_integration_start,
+
+      COUNT(DISTINCT CASE
+        WHEN ms_1555_construction_complete_actual IS NOT NULL
+         AND pj_completion_objective_actual_date IS NULL
+         AND pj_a_5270_integration_start_finish IS NOT NULL
+         AND ms_1970_integration_complete_actual IS NULL
+        THEN pj_project_id END
+      ) AS pending_integration_complete,
+
+      COUNT(DISTINCT CASE
+        WHEN ms_1555_construction_complete_actual IS NOT NULL
+         AND pj_completion_objective_actual_date IS NULL
+         AND ms_1970_integration_complete_actual IS NOT NULL
+         AND ms_1559_cop_approved_by_t_mobile_actual IS NULL
+        THEN pj_project_id END
+      ) AS pending_cop_approval,
+
+      COUNT(DISTINCT CASE
+        WHEN ms_1555_construction_complete_actual IS NOT NULL
+         AND pj_completion_objective_actual_date IS NULL
+         AND ms_1559_cop_approved_by_t_mobile_actual IS NOT NULL
+        THEN pj_project_id END
+      ) AS pending_other
+
+    FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined
+    {where_sql}
+    GROUP BY rgn_region, m_area, m_market, pj_general_contractor
+    ORDER BY rgn_region, m_area, m_market, pj_general_contractor
+    """"""
+
+    return execute_query(sql)
+",NTM/AHLOA,"            TRY_TO_DATE(pj_d_onair_finish),",Duplicate,Duplicate,,,
+ NDPc Quality FTR Rate,"kpi_python_function: def get_ndpc_quality_ftr_rate(execute_query, filters=None) -> list[dict]:
+    """"""NDPc Quality FTR Rate (%): audited projects that are First Time Right / audited projects.
+
+    Denominator: DISTINCT pj_project_id where ms_1556_punch_checklist_audit_completed_by_nokia_actual IS NOT NULL.
+    Numerator: DISTINCT pj_project_id where ms_1556... IS NOT NULL AND NULLIF(TRIM(first_time_right),'') = 'Yes'.
+
+    Output grouped by (default): rgn_region, m_area, m_market, pj_general_contractor.
+    Optional extra segmentation: por_category, s_site_class when filters['group_by'] includes them.
+    """"""
+
+    filters = filters or {}
+
+    # ---- grouping ----
+    default_group = [""rgn_region"", ""m_area"", ""m_market"", ""pj_general_contractor""]
+    allowed_optional = {""por_category"", ""s_site_class""}
+
+    group_by = filters.get(""group_by"")
+    if group_by is None:
+        group_cols = list(default_group)
+    else:
+        if isinstance(group_by, str):
+            group_by = [g.strip() for g in group_by.split("","") if g.strip()]
+        group_cols = []
+        for g in group_by:
+            if g in default_group or g in allowed_optional:
+                if g not in group_cols:
+                    group_cols.append(g)
+        if not group_cols:
+            group_cols = list(default_group)
+
+    # ---- WHERE clause from filters ----
+    # Only apply filters that are known/used for slicing this KPI.
+    where_parts = []
+
+    def esc(v):
+        return str(v).replace(""'"", ""''"")
+
+    # Base filter: only audited rows (avoids zero-audit noise groups)
+    where_parts.append(""ms_1556_punch_checklist_audit_completed_by_nokia_actual IS NOT NULL"")
+
+    # Date range applies to the Nokia audit completion timestamp
+    start_date = filters.get(""start_date"")
+    end_date = filters.get(""end_date"")
+    if start_date:
+        where_parts.append(
+            f""ms_1556_punch_checklist_audit_completed_by_nokia_actual >= '{esc(start_date)}'""
+        )
+    if end_date:
+        where_parts.append(
+            f""ms_1556_punch_checklist_audit_completed_by_nokia_actual <= '{esc(end_date)}'""
+        )
+
+    # Common dimensional filters
+    for k in [
+        ""rgn_region"",
+        ""m_area"",
+        ""m_market"",
+        ""pj_general_contractor"",
+        ""pj_project_id"",
+        ""por_category"",
+        ""s_site_class"",
+    ]:
+        if filters.get(k) is not None and filters.get(k) != """":
+            where_parts.append(f""{k} = '{esc(filters.get(k))}'"")
+
+    where_sql = (""WHERE "" + "" AND "".join(where_parts)) if where_parts else """"
+
+    # ---- raw SQL (needed because we must reference ms_1556... and first_time_right columns not exposed by Tier-1 accessors) ----
+    group_sql = "", "".join(group_cols)
+    select_group_sql = (group_sql + "", "") if group_cols else """"
+
+    sql = f""""""
+        SELECT
+            {select_group_sql}
+            COUNT(DISTINCT CASE
+                WHEN ms_1556_punch_checklist_audit_completed_by_nokia_actual IS NOT NULL
+                THEN pj_project_id
+                ELSE NULL
+            END) AS audited_count,
+            COUNT(DISTINCT CASE
+                WHEN ms_1556_punch_checklist_audit_completed_by_nokia_actual IS NOT NULL
+                 AND NULLIF(TRIM(first_time_right), '') = 'Yes'
+                THEN pj_project_id
+                ELSE NULL
+            END) AS ftr_yes_count
+        FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined
+        {where_sql}
+        GROUP BY {group_sql}
+        ORDER BY {group_sql}
+    """"""
+
+    rows = execute_query(sql, db=None, max_rows=None) or []
+
+    out = []
+    for r in rows:
+        audited = r.get(""audited_count"") or 0
+        ftr_yes = r.get(""ftr_yes_count"") or 0
+        not_ftr_or_unknown = audited - ftr_yes
+        ftr_rate_pct = (100.0 * ftr_yes / audited) if audited else None
+
+        rec = {c: r.get(c) for c in group_cols}
+        rec.update(
+            {
+                ""audited_count"": audited,
+                ""ftr_yes_count"": ftr_yes,
+                ""not_ftr_or_unknown_count"": not_ftr_or_unknown,
+                ""ftr_rate_pct"": ftr_rate_pct,
+            }
+        )
+        out.append(rec)
+
+    return out
+",NTM/AHLOA,            TRY_TO_DATE(pj_e_onair_finish),"services_ndpc_answers_daily_from_sdb table should be used. ""Answer status""=2 is referred as rejected. Answer status='0' considered as submitted.
+If we have rejection, then non FTR. 
+SIte wise mapping can be done ""scop_title"" in combined table & ""Session Title"" in NDPc table",,,,
+ Intermediate MS Lead Time,"kpi_python_function: def get_intermediate_ms_lead_time(execute_query, filters=None) -> list[dict]:
+    import datetime
+
+    def _parse_date(val):
+        if val is None:
+            return None
+        if isinstance(val, datetime.date) and not isinstance(val, datetime.datetime):
+            return val
+        if isinstance(val, datetime.datetime):
+            return val.date()
+        s = str(val).strip()
+        if not s or s.lower() in (""null"", ""none"", ""nan""):
+            return None
+        # Handle 'YYYY-MM-DD' and timestamps like 'YYYY-MM-DD HH:MM:SS[.ffffff][+TZ]'
+        try:
+            # datetime.fromisoformat handles many ISO-like forms
+            return datetime.datetime.fromisoformat(s.replace(""Z"", ""+00:00"")).date()
+        except Exception:
+            pass
+        for fmt in (""%Y-%m-%d"", ""%Y-%m-%d %H:%M:%S"", ""%Y-%m-%d %H:%M:%S.%f""):
+            try:
+                return datetime.datetime.strptime(s[:26], fmt).date()
+            except Exception:
+                continue
+        return None
+
+    # Optional filters supported by KPI request
+    filters = filters or {}
+
+    # If a date window is provided, we apply it to the *end milestone* date (per-segment)
+    # in Python (since milestone columns are wide and segment-specific).
+    start_date = _parse_date(filters.get(""start_date""))
+    end_date = _parse_date(filters.get(""end_date""))
+
+    # Build a lightweight SQL to pull only needed columns from the wide table.
+    # Tier-1 accessors don't expose the milestone date columns required, so we use raw SQL.
+    where_parts = []
+    # Allow filtering by portfolio dimensions and por_category (explicitly requested)
+    for k in (""rgn_region"", ""m_area"", ""m_market"", ""pj_general_contractor"", ""pj_project_id"", ""por_category""):
+        if k in filters and filters.get(k) is not None and str(filters.get(k)).strip() != """":
+            v = str(filters.get(k)).replace(""'"", ""''"")
+            where_parts.append(f""{k} = '{v}'"")
+
+    where_sql = (""WHERE "" + "" AND "".join(where_parts)) if where_parts else """"
+
+    sql = f""""""
+        SELECT
+            pj_project_id,
+            rgn_region,
+            m_area,
+            m_market,
+            pj_general_contractor,
+            por_category,
+            ms_1310_pre_construction_package_received_actual,
+            ms_1323_ready_for_scoping_actual,
+            ms_1507_tower_ntp_approved_actual,
+            \""pj_a_3925_msl_pickup_date_finish\"",
+            ms_1550_construction_start_actual,
+            ms_1555_construction_complete_actual,
+            pj_a_5270_integration_start_finish,
+            ms_1970_integration_complete_actual,
+            ms_1559_cop_approved_by_t_mobile_actual,
+            pj_completion_objective_actual_date
+        FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined
+        {where_sql}
+    """"""
+
+    rows = execute_query(sql)
+
+    segments = [
+        {
+            ""segment_name"": ""Pre-NTP to Scoping Ready"",
+            ""start_col"": ""ms_1310_pre_construction_package_received_actual"",
+            ""end_col"": ""ms_1323_ready_for_scoping_actual"",
+            ""start_name"": ""ms_1310_pre_construction_package_received_actual"",
+            ""end_name"": ""ms_1323_ready_for_scoping_actual"",
+        },
+        {
+            ""segment_name"": ""Scoping to NTP Approved"",
+            ""start_col"": ""ms_1323_ready_for_scoping_actual"",
+            ""end_col"": ""ms_1507_tower_ntp_approved_actual"",
+            ""start_name"": ""ms_1323_ready_for_scoping_actual"",
+            ""end_name"": ""ms_1507_tower_ntp_approved_actual"",
+        },
+        {
+            ""segment_name"": ""NTP to Material Pickup"",
+            ""start_col"": ""ms_1507_tower_ntp_approved_actual"",
+            ""end_col"": ""pj_a_3925_msl_pickup_date_finish"",
+            ""start_name"": ""ms_1507_tower_ntp_approved_actual"",
+            ""end_name"": ""pj_a_3925_msl_pickup_date_finish"",
+        },
+        {
+            ""segment_name"": ""Material to CX Start"",
+            ""start_col"": ""pj_a_3925_msl_pickup_date_finish"",
+            ""end_col"": ""ms_1550_construction_start_actual"",
+            ""start_name"": ""pj_a_3925_msl_pickup_date_finish"",
+            ""end_name"": ""ms_1550_construction_start_actual"",
+        },
+        {
+            ""segment_name"": ""CX Start to CX Complete"",
+            ""start_col"": ""ms_1550_construction_start_actual"",
+            ""end_col"": ""ms_1555_construction_complete_actual"",
+            ""start_name"": ""ms_1550_construction_start_actual"",
+            ""end_name"": ""ms_1555_construction_complete_actual"",
+        },
+        {
+            ""segment_name"": ""CX Complete to IX Start"",
+            ""start_col"": ""ms_1555_construction_complete_actual"",
+            ""end_col"": ""pj_a_5270_integration_start_finish"",
+            ""start_name"": ""ms_1555_construction_complete_actual"",
+            ""end_name"": ""pj_a_5270_integration_start_finish"",
+        },
+        {
+            ""segment_name"": ""IX Start to IX Complete"",
+            ""start_col"": ""pj_a_5270_integration_start_finish"",
+            ""end_col"": ""ms_1970_integration_complete_actual"",
+            ""start_name"": ""pj_a_5270_integration_start_finish"",
+            ""end_name"": ""ms_1970_integration_complete_actual"",
+        },
+        {
+            ""segment_name"": ""IX Complete to COP"",
+            ""start_col"": ""ms_1970_integration_complete_actual"",
+            ""end_col"": ""ms_1559_cop_approved_by_t_mobile_actual"",
+            ""start_name"": ""ms_1970_integration_complete_actual"",
+            ""end_name"": ""ms_1559_cop_approved_by_t_mobile_actual"",
+        },
+        {
+            ""segment_name"": ""COP to On-Air"",
+            ""start_col"": ""ms_1559_cop_approved_by_t_mobile_actual"",
+            ""end_col"": ""pj_completion_objective_actual_date"",
+            ""start_name"": ""ms_1559_cop_approved_by_t_mobile_actual"",
+            ""end_name"": ""pj_completion_objective_actual_date"",
+        },
+    ]
+
+    # Build unpivoted lead-time facts in Python
+    facts = []
+    for r in rows:
+        pj_project_id = r.get(""pj_project_id"")
+        dims = {
+            ""rgn_region"": r.get(""rgn_region""),
+            ""m_area"": r.get(""m_area""),
+            ""m_market"": r.get(""m_market""),
+            ""pj_general_contractor"": r.get(""pj_general_contractor""),
+        }
+
+        for seg in segments:
+            start_dt = _parse_date(r.get(seg[""start_col""]))
+            end_dt = _parse_date(r.get(seg[""end_col""]))
+            if start_dt is None or end_dt is None:
+                continue
+            lead_days = (end_dt - start_dt).days
+            if lead_days is None or lead_days < 0:
+                continue
+            # Apply optional date range filter to the end milestone date
+            if start_date and end_dt < start_date:
+                continue
+            if end_date and end_dt > end_date:
+                continue
+
+            facts.append({
+                ""pj_project_id"": pj_project_id,
+                **dims,
+                ""segment_name"": seg[""segment_name""],
+                ""start_milestone_name"": seg[""start_name""],
+                ""end_milestone_name"": seg[""end_name""],
+                ""lead_days"": lead_days,
+            })
+
+    # Aggregate: one row per (rgn_region, m_area, m_market, pj_general_contractor, segment_name)
+    def _percentile_cont(sorted_vals, p):
+        n = len(sorted_vals)
+        if n == 0:
+            return None
+        if n == 1:
+            return float(sorted_vals[0])
+        # Continuous percentile like PostgreSQL percentile_cont
+        pos = p * (n - 1)
+        lo = int(pos)
+        hi = min(lo + 1, n - 1)
+        frac = pos - lo
+        return float(sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * frac)
+
+    groups = {}
+    for f in facts:
+        key = (
+            f.get(""rgn_region""),
+            f.get(""m_area""),
+            f.get(""m_market""),
+            f.get(""pj_general_contractor""),
+            f.get(""segment_name""),
+        )
+        g = groups.setdefault(key, {""vals"": [], ""projects"": set()})
+        g[""vals""].append(f[""lead_days""])
+        if f.get(""pj_project_id"") is not None:
+            g[""projects""].add(f[""pj_project_id""])
+
+    out = []
+    for key, g in groups.items():
+        rgn_region, m_area, m_market, pj_general_contractor, segment_name = key
+        vals = sorted(g[""vals""])
+        avg_days = (sum(vals) / len(vals)) if vals else None
+        out.append({
+            ""rgn_region"": rgn_region,
+            ""m_area"": m_area,
+            ""m_market"": m_market,
+            ""pj_general_contractor"": pj_general_contractor,
+            ""segment_name"": segment_name,
+            ""avg_days"": float(avg_days) if avg_days is not None else None,
+            ""p50_days"": _percentile_cont(vals, 0.5),
+            ""p90_days"": _percentile_cont(vals, 0.9),
+            ""project_count"": len(g[""projects""]),
+        })
+
+    return out
+",NTM/AHLOA,            -- ?? add ALL columns that match '%onair_finish%',"there are another set of Milestones from Magenta, need to consider those as well.. pls connect to Talib","there are another set of Milestones from Magenta, need to consider those as well.. pls connect to Talib",,,
+ Ready Site Backlog,"kpi_python_function: def get_ready_site_backlog(execute_query, filters=None) -> list[dict]:
+    """"""Counts projects ready to start construction but not started yet, grouped by region/area/market and GC.""""""
+
+    def _sql_escape(v):
+        return str(v).replace(""'"", ""''"")
+
+    # Base WHERE clauses from KPI definition
+    where_parts = [
+        ""ms_1550_construction_start_actual IS NULL"",
+        ""(ms_1507_tower_ntp_approved_actual IS NOT NULL OR \""pj_a_4100_construction_ntp_accepted_by_gc_finish\"" IS NOT NULL)"",
+        ""\""pj_a_3925_msl_pickup_date_finish\"" IS NOT NULL"",
+        ""\""pj_a_4525_power_ready_finish\"" IS NOT NULL"",
+        ""(\""pj_a_4925_aav_fiber_ready_finish\"" IS NOT NULL OR \""pj_a_4425_mw_installation_complete_finish\"" IS NOT NULL)""
+    ]
+
+    # Optional user filters (kept flexible)
+    filters = filters or {}
+
+    # Common dimension filters
+    if filters.get(""rgn_region"") is not None:
+        where_parts.append(f""rgn_region = '{_sql_escape(filters['rgn_region'])}'"")
+    if filters.get(""m_area"") is not None:
+        where_parts.append(f""m_area = '{_sql_escape(filters['m_area'])}'"")
+    if filters.get(""m_market"") is not None:
+        where_parts.append(f""m_market = '{_sql_escape(filters['m_market'])}'"")
+    if filters.get(""pj_general_contractor"") is not None:
+        where_parts.append(f""pj_general_contractor = '{_sql_escape(filters['pj_general_contractor'])}'"")
+    if filters.get(""pj_project_id"") is not None:
+        where_parts.append(f""pj_project_id = '{_sql_escape(filters['pj_project_id'])}'"")
+    if filters.get(""s_site_id"") is not None:
+        where_parts.append(f""s_site_id = '{_sql_escape(filters['s_site_id'])}'"")
+
+    # Optional date window: apply against construction-start actual (even though NULL),
+    # so instead apply to a readiness anchor if provided.
+    # Use MSI pickup finish as the anchor (earliest hard readiness gate in this KPI).
+    if filters.get(""start_date"") is not None:
+        where_parts.append(f""\""pj_a_3925_msl_pickup_date_finish\"" >= '{_sql_escape(filters['start_date'])}'"")
+    if filters.get(""end_date"") is not None:
+        where_parts.append(f""\""pj_a_3925_msl_pickup_date_finish\"" < '{_sql_escape(filters['end_date'])}'"")
+
+    where_sql = "" AND "".join(where_parts)
+
+    sql = (
+        ""SELECT ""
+        ""  rgn_region, ""
+        ""  m_area, ""
+        ""  m_market, ""
+        ""  pj_general_contractor, ""
+        ""  COUNT(DISTINCT pj_project_id) AS ready_site_backlog ""
+        ""FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined ""
+        f""WHERE {where_sql} ""
+        ""GROUP BY rgn_region, m_area, m_market, pj_general_contractor ""
+        ""ORDER BY rgn_region, m_area, m_market, pj_general_contractor""
+    )
+
+    rows = execute_query(sql, db=None, max_rows=None) or []
+
+    # Normalize output keys
+    out = []
+    for r in rows:
+        out.append({
+            ""rgn_region"": r.get(""rgn_region""),
+            ""m_area"": r.get(""m_area""),
+            ""m_market"": r.get(""m_market""),
+            ""pj_general_contractor"": r.get(""pj_general_contractor""),
+            ""ready_site_backlog"": r.get(""ready_site_backlog"")
+        })
+    return out
+",NTM/AHLOA,        ) AS on_air_date,,,,,
+ Site Blocker Analysis,"kpi_python_function: def get_site_blocker_analysis(execute_query, filters=None) -> list[dict]:
+    """"""Market-level breakdown of prerequisite blockers for active projects not started.
+
+    Population:
+      pj_project_status = 'Active'
+      AND ms_1550_construction_start_actual IS NULL
+
+    Optional enhancement:
+      If filters contains 'group_by_gc': truthy, include pj_general_contractor in grouping.
+      You can also filter by pj_general_contractor / rgn_region / m_area / m_market via filters.
+    """"""
+
+    filters = filters or {}
+
+    # Build SQL WHERE clause (PostgreSQL)
+    where_parts = [
+        ""pj_project_status = 'Active'"",
+        ""ms_1550_construction_start_actual IS NULL""
+    ]
+
+    # Allow common dimension filters (and passthrough of any additional column filters)
+    passthrough_keys = [
+        'rgn_region', 'm_area', 'm_market',
+        'pj_general_contractor', 'pj_project_id',
+        'pj_program_name', 'pj_project_type'
+    ]
+
+    for k in passthrough_keys:
+        if k in filters and filters.get(k) is not None and filters.get(k) != '':
+            v = str(filters.get(k)).replace(""'"", ""''"")
+            where_parts.append(f""{k} = '{v}'"")
+
+    # NOTE: No date filter is applied because the KPI definition is point-in-time and
+    # milestone fields are nullable timestamps rather than event records.
+
+    where_sql = "" AND "".join(where_parts)
+
+    group_by_gc = bool(filters.get('group_by_gc'))
+
+    group_cols = [""rgn_region"", ""m_area"", ""m_market""]
+    if group_by_gc:
+        group_cols.append(""pj_general_contractor"")
+
+    select_group_cols = "",\n            "".join(group_cols)
+    group_by_sql = "", "".join(group_cols)
+
+    # Raw SQL is required because Tier-1 accessors do not expose the milestone columns needed.
+    sql = f""""""
+        SELECT
+            {select_group_cols},
+            pj_project_id,
+            ms_1550_construction_start_actual,
+            ms_1507_tower_ntp_approved_actual,
+            pj_a_4100_construction_ntp_accepted_by_gc_finish,
+            ""pj_a_3925_msl_pickup_date_finish"",
+            pj_a_4525_power_ready_finish,
+            pj_a_4925_aav_fiber_ready_finish,
+            pj_a_4425_mw_installation_complete_finish,
+            pj_a_3825_pre_construction_walk_complete_finish
+        FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined
+        WHERE {where_sql}
+    """"""
+
+    rows = execute_query(sql)
+
+    def is_null(x):
+        # Treat None and empty-string as null-like; do NOT treat '0' as null.
+        return x is None or (isinstance(x, str) and x.strip() == '')
+
+    # Aggregate per group key with DISTINCT project ids
+    agg = {}
+
+    for r in rows:
+        key_vals = []
+        for c in group_cols:
+            key_vals.append(r.get(c))
+        key = tuple(key_vals)
+
+        if key not in agg:
+            agg[key] = {
+                ""rgn_region"": r.get(""rgn_region""),
+                ""m_area"": r.get(""m_area""),
+                ""m_market"": r.get(""m_market""),
+                **({""pj_general_contractor"": r.get(""pj_general_contractor"")} if group_by_gc else {}),
+                ""_projects"": set(),
+                ""total_pipeline"": 0,
+                ""fully_ready"": 0,
+                ""blocked_by_ntp"": 0,
+                ""blocked_by_material"": 0,
+                ""blocked_by_power"": 0,
+                ""blocked_by_backhaul"": 0,
+                ""blocked_by_access"": 0,
+                ""blocked_multi"": 0
+            }
+
+        project_id = r.get(""pj_project_id"")
+        if project_id in agg[key][""_projects""]:
+            continue
+        agg[key][""_projects""].add(project_id)
+
+        blocked_ntp = is_null(r.get(""ms_1507_tower_ntp_approved_actual"")) and is_null(r.get(""pj_a_4100_construction_ntp_accepted_by_gc_finish""))
+        blocked_material = is_null(r.get(""pj_a_3925_msl_pickup_date_finish""))
+        blocked_power = is_null(r.get(""pj_a_4525_power_ready_finish""))
+        # Backhaul is cleared if either fiber-ready OR MW-complete is present
+        blocked_backhaul = is_null(r.get(""pj_a_4925_aav_fiber_ready_finish"")) and is_null(r.get(""pj_a_4425_mw_installation_complete_finish""))
+        blocked_access = is_null(r.get(""pj_a_3825_pre_construction_walk_complete_finish""))
+
+        blockers = [blocked_ntp, blocked_material, blocked_power, blocked_backhaul, blocked_access]
+        blocker_count = sum(1 for b in blockers if b)
+
+        agg[key][""total_pipeline""] += 1
+        if blocker_count == 0:
+            agg[key][""fully_ready""] += 1
+        if blocked_ntp:
+            agg[key][""blocked_by_ntp""] += 1
+        if blocked_material:
+            agg[key][""blocked_by_material""] += 1
+        if blocked_power:
+            agg[key][""blocked_by_power""] += 1
+        if blocked_backhaul:
+            agg[key][""blocked_by_backhaul""] += 1
+        if blocked_access:
+            agg[key][""blocked_by_access""] += 1
+        if blocker_count >= 2:
+            agg[key][""blocked_multi""] += 1
+
+    # finalize
+    out = []
+    for k, v in agg.items():
+        v.pop(""_projects"", None)
+        out.append(v)
+
+    # Stable ordering
+    def sort_key(d):
+        base = (
+            str(d.get('rgn_region') or ''),
+            str(d.get('m_area') or ''),
+            str(d.get('m_market') or '')
+        )
+        if group_by_gc:
+            base = base + (str(d.get('pj_general_contractor') or ''),)
+        return base
+
+    out.sort(key=sort_key)
+    return out
+",NTM/AHLOA,,,,,,
+ Capacity vs Demand Gap,"kpi_python_function: def get_capacity_vs_demand_gap(execute_query, filters=None) -> list[dict]:
+    """"""Capacity vs Demand Gap per (rgn_region, m_area, m_market, pj_general_contractor).
+
+    run_rate = COUNT(DISTINCT completed projects in trailing 12 weeks) / 12
+    backlog  = COUNT(DISTINCT projects not started as-of CURRENT_DATE that meet readiness gates)
+    gap      = run_rate - backlog
+
+    Notes:
+      - Uses raw SQL against pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined for milestone fields.
+      - Readiness gates are aligned to the Ready Site Backlog KPI's 4-gate definition.
+      - Long column names are double-quoted to avoid truncation/case issues.
+    """"""
+
+    filters = filters or {}
+
+    def esc(v):
+        return str(v).replace(""'"", ""''"")
+
+    where_parts = []
+    if filters.get(""rgn_region"") is not None:
+        where_parts.append(f""rgn_region = '{esc(filters['rgn_region'])}'"")
+    if filters.get(""m_area"") is not None:
+        where_parts.append(f""m_area = '{esc(filters['m_area'])}'"")
+    if filters.get(""m_market"") is not None:
+        where_parts.append(f""m_market = '{esc(filters['m_market'])}'"")
+    if filters.get(""pj_general_contractor"") is not None:
+        where_parts.append(f""pj_general_contractor = '{esc(filters['pj_general_contractor'])}'"")
+    if filters.get(""pj_program_name"") is not None:
+        where_parts.append(f""pj_program_name = '{esc(filters['pj_program_name'])}'"")
+    if filters.get(""pj_project_type"") is not None:
+        where_parts.append(f""pj_project_type = '{esc(filters['pj_project_type'])}'"")
+
+    where_sql = (""WHERE "" + "" AND "".join(where_parts)) if where_parts else """"
+
+    completed_col = '""ms_1555_construction_complete_actual""'
+    started_col = '""ms_1550_construction_start_actual""'
+
+    readiness_expr = """"""
+    (
+      (""ms_1507_tower_ntp_approved_actual"" IS NOT NULL
+         OR ""pj_a_4100_construction_ntp_accepted_by_gc_finish"" IS NOT NULL)
+      AND ""pj_a_3925_msl_pickup_date_finish"" IS NOT NULL
+      AND ""pj_a_4525_power_ready_finish"" IS NOT NULL
+      AND (""pj_a_4925_aav_fiber_ready_finish"" IS NOT NULL
+         OR ""pj_a_4425_mw_installation_complete_finish"" IS NOT NULL)
+    )
+    """"""
+
+    sql = f""""""
+    WITH base AS (
+      SELECT
+        rgn_region,
+        m_area,
+        m_market,
+        pj_general_contractor,
+        pj_project_id,
+        {completed_col}::timestamp AS completed_at,
+        {started_col}::timestamp AS started_at,
+        {readiness_expr} AS is_ready
+      FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined
+      {where_sql}
+    ),
+    run_rate_by_grp AS (
+      SELECT
+        rgn_region,
+        m_area,
+        m_market,
+        pj_general_contractor,
+        COUNT(DISTINCT pj_project_id) AS completed_12w
+      FROM base
+      WHERE completed_at IS NOT NULL
+        AND completed_at >= (CURRENT_DATE - INTERVAL '84 days')
+        AND completed_at < (CURRENT_DATE + INTERVAL '1 day')
+      GROUP BY 1,2,3,4
+    ),
+    backlog_by_grp AS (
+      SELECT
+        rgn_region,
+        m_area,
+        m_market,
+        pj_general_contractor,
+        COUNT(DISTINCT pj_project_id) AS ready_not_started
+      FROM base
+      WHERE started_at IS NULL
+        AND is_ready
+      GROUP BY 1,2,3,4
+    ),
+    all_grps AS (
+      SELECT DISTINCT rgn_region, m_area, m_market, pj_general_contractor
+      FROM base
+      WHERE pj_general_contractor IS NOT NULL
+        AND m_market IS NOT NULL
+    )
+    SELECT
+      g.rgn_region,
+      g.m_area,
+      g.m_market,
+      g.pj_general_contractor,
+      COALESCE(r.completed_12w, 0)::numeric / 12.0 AS run_rate,
+      COALESCE(b.ready_not_started, 0) AS backlog,
+      (COALESCE(r.completed_12w, 0)::numeric / 12.0) - COALESCE(b.ready_not_started, 0) AS gap
+    FROM all_grps g
+    LEFT JOIN run_rate_by_grp r
+      ON r.rgn_region = g.rgn_region
+     AND r.m_area = g.m_area
+     AND r.m_market = g.m_market
+     AND r.pj_general_contractor = g.pj_general_contractor
+    LEFT JOIN backlog_by_grp b
+      ON b.rgn_region = g.rgn_region
+     AND b.m_area = g.m_area
+     AND b.m_market = g.m_market
+     AND b.pj_general_contractor = g.pj_general_contractor
+    ORDER BY g.rgn_region, g.m_area, g.m_market, g.pj_general_contractor
+    ;
+    """"""
+
+    return execute_query(sql)
+",NTM/AHLOA,    FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined,there ia no data points available for now,,,,
+ Intermediate Milestone Lead Time,"kpi_python_function: def get_intermediate_milestone_lead_time(execute_query, filters=None) -> list[dict]:
+    """"""Compute intermediate milestone lead times per segment and aggregate by (region, area, market, GC, segment).
+
+    Optional filters supported (if provided in `filters`):
+      - por_category: restrict projects to a given POR category (not in default group-by)
+      - rgn_region, m_area, m_market, pj_general_contractor, pj_project_id: pass-through filters to base table
+      - start_date, end_date: applied to segment end milestone date (end_column::date within range)
+
+    Returns rows:
+      rgn_region, m_area, m_market, pj_general_contractor, segment_name,
+      avg_days, p50_days, p90_days, project_count
+    """"""
+
+    filters = filters or {}
+
+    def _escape(v):
+        return str(v).replace(""'"", ""''"")
+
+    # Base WHERE clause: only filters that exist as columns on the wide table.
+    # (We intentionally do not include start_date/end_date here because we apply them to each segment's end date.)
+    passthrough_keys = [
+        ""pj_project_id"",
+        ""rgn_region"",
+        ""m_area"",
+        ""m_market"",
+        ""pj_general_contractor"",
+        ""por_category"",
+    ]
+    where_parts = []
+    for k in passthrough_keys:
+        if k in filters and filters.get(k) not in (None, """"):
+            where_parts.append(f""{k} = '{_escape(filters.get(k))}'"")
+    where_sql = (""WHERE "" + "" AND "".join(where_parts)) if where_parts else """"
+
+    # Date range filters (applied to end milestone date for each segment)
+    start_date = filters.get(""start_date"")
+    end_date = filters.get(""end_date"")
+
+    # Segment definitions: (segment_name, start_column_sql, end_column_sql)
+    segments = [
+        (
+            ""Pre-NTP to Scoping Ready"",
+            ""ms_1310_pre_construction_package_received_actual"",
+            ""ms_1323_ready_for_scoping_actual"",
+        ),
+        (
+            ""Scoping to NTP Approved"",
+            ""ms_1323_ready_for_scoping_actual"",
+            ""ms_1507_tower_ntp_approved_actual"",
+        ),
+        (
+            ""NTP to Material Pickup"",
+            ""ms_1507_tower_ntp_approved_actual"",
+            '""pj_a_3925_msl_pickup_date_finish""',
+        ),
+        (
+            ""Material to CX Start"",
+            '""pj_a_3925_msl_pickup_date_finish""',
+            ""ms_1550_construction_start_actual"",
+        ),
+        (
+            ""CX Start to CX Complete"",
+            ""ms_1550_construction_start_actual"",
+            ""ms_1555_construction_complete_actual"",
+        ),
+        (
+            ""CX Complete to IX Start"",
+            ""ms_1555_construction_complete_actual"",
+            ""pj_a_5270_integration_start_finish"",
+        ),
+        (
+            ""IX Start to IX Complete"",
+            ""pj_a_5270_integration_start_finish"",
+            ""ms_1970_integration_complete_actual"",
+        ),
+        (
+            ""IX Complete to COP"",
+            ""ms_1970_integration_complete_actual"",
+            ""ms_1559_cop_approved_by_t_mobile_actual"",
+        ),
+        (
+            ""COP to On-Air"",
+            ""ms_1559_cop_approved_by_t_mobile_actual"",
+            ""pj_completion_objective_actual_date"",
+        ),
+    ]
+
+    # Build UNION ALL unpivot with lead_days and filtering rules:
+    # - exclude NULL start or end
+    # - exclude negative lead_days
+    # - optionally filter by end milestone date between start_date/end_date
+    union_selects = []
+    for segment_name, start_col, end_col in segments:
+        seg_filters = [
+            f""{start_col} IS NOT NULL"",
+            f""{end_col} IS NOT NULL"",
+            f""(({end_col})::date - ({start_col})::date) >= 0"",
+        ]
+        if start_date not in (None, """"):
+            seg_filters.append(f""({end_col})::date >= '{_escape(start_date)}'::date"")
+        if end_date not in (None, """"):
+            seg_filters.append(f""({end_col})::date <= '{_escape(end_date)}'::date"")
+
+        seg_where = "" AND "".join(seg_filters)
+
+        union_selects.append(
+            ""\n"".join(
+                [
+                    ""SELECT"",
+                    ""  pj_project_id,"",
+                    f""  '{_escape(segment_name)}'::text AS segment_name,"",
+                    f""  (({end_col})::date - ({start_col})::date)::int AS lead_days,"",
+                    ""  rgn_region,"",
+                    ""  m_area,"",
+                    ""  m_market,"",
+                    ""  pj_general_contractor,"",
+                    ""  por_category"",
+                    ""FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined"",
+                    where_sql,
+                    (""AND "" if where_sql else ""WHERE "") + seg_where,
+                ]
+            )
+        )
+
+    unpivot_sql = ""\nUNION ALL\n"".join(union_selects)
+
+    # Aggregate with AVG and percentiles.
+    # Note: percentile_cont ignores NULLs; lead_days is non-null by construction.
+    # por_category is filterable but intentionally excluded from GROUP BY.
+    agg_sql = ""\n"".join(
+        [""WITH segment_leads AS (""]
+        + [unpivot_sql]
+        + [
+            "")"",
+            ""SELECT"",
+            ""  rgn_region,"",
+            ""  m_area,"",
+            ""  m_market,"",
+            ""  pj_general_contractor,"",
+            ""  segment_name,"",
+            ""  AVG(lead_days)::numeric(18,2) AS avg_days,"",
+            ""  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY lead_days) AS p50_days,"",
+            ""  PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY lead_days) AS p90_days,"",
+            ""  COUNT(DISTINCT pj_project_id) AS project_count"",
+            ""FROM segment_leads"",
+            ""GROUP BY rgn_region, m_area, m_market, pj_general_contractor, segment_name"",
+            ""ORDER BY rgn_region, m_area, m_market, pj_general_contractor, segment_name"",
+        ]
+    )
+
+    return execute_query(agg_sql)
+",NTM/AHLOA,    WHERE 1=1,,,,,
+ Milestone Aging Alert,"kpi_python_function: def get_milestone_aging_alert(execute_query, filters=None) -> list[dict]:
+    import datetime
+    from statistics import mean
+
+    filters = filters or {}
+
+    # --- SLA + thresholds configuration ---
+    # NOTE: use physical milestone column names from stg_ndpd_mbt_tmobile_macro_combined
+    default_pairs = [
+        (""ms_1323_ready_for_scoping_actual"", ""ms_1310_pre_construction_package_received_actual"", 14),
+        (""ms_1327_scoping_and_quoting_package_validated_actual"", ""ms_1323_ready_for_scoping_actual"", 10),
+        (""ms_1507_tower_ntp_approved_actual"", ""ms_1327_scoping_and_quoting_package_validated_actual"", 21),
+        (""ms_1550_construction_start_actual"", ""ms_1507_tower_ntp_approved_actual"", 14),
+        (""ms_1555_construction_complete_actual"", ""ms_1550_construction_start_actual"", 21),
+        (""ms_1970_integration_complete_actual"", ""ms_1555_construction_complete_actual"", 30),
+        (""ms_1559_cop_approved_by_t_mobile_actual"", ""ms_1970_integration_complete_actual"", 14),
+    ]
+
+    sla_override = filters.get(""sla_config"") or {}
+    risk_threshold_pct = float(filters.get(""risk_threshold_pct"", 50))
+    breach_threshold_pct = float(filters.get(""breach_threshold_pct"", 100))
+
+    include_gc = bool(filters.get(""include_gc"", False))
+
+    # Allow overriding which milestone pairs are evaluated
+    # Expected format: [{""milestone_name"":""<physical_col>"",""predecessor_name"":""<physical_col>"",""expected_sla_days"":14}, ...]
+    milestone_pairs = []
+    if filters.get(""milestone_pairs""):
+        for mp in (filters.get(""milestone_pairs"") or []):
+            milestone_pairs.append(
+                (
+                    mp.get(""milestone_name""),
+                    mp.get(""predecessor_name""),
+                    int(mp.get(""expected_sla_days"")) if mp.get(""expected_sla_days"") is not None else None,
+                )
+            )
+    else:
+        milestone_pairs = list(default_pairs)
+
+    # --- Helpers ---
+    def _to_date(v):
+        if v is None or v == """":
+            return None
+        if isinstance(v, datetime.date) and not isinstance(v, datetime.datetime):
+            return v
+        if isinstance(v, datetime.datetime):
+            return v.date()
+        s = str(v).strip()
+        # handle ISO and 'YYYY-MM-DD HH:MM:SS'
+        try:
+            return datetime.datetime.fromisoformat(s.replace(""Z"", ""+00:00"")).date()
+        except Exception:
+            pass
+        for fmt in (""%Y-%m-%d"", ""%Y-%m-%d %H:%M:%S"", ""%m/%d/%Y"", ""%m/%d/%Y %H:%M:%S""):
+            try:
+                return datetime.datetime.strptime(s, fmt).date()
+            except Exception:
+                continue
+        return None
+
+    def _percentile_cont(sorted_vals, p):
+        # Continuous percentile consistent with PostgreSQL percentile_cont
+        n = len(sorted_vals)
+        if n == 0:
+            return None
+        if n == 1:
+            return float(sorted_vals[0])
+        if p <= 0:
+            return float(sorted_vals[0])
+        if p >= 1:
+            return float(sorted_vals[-1])
+        k = (n - 1) * p
+        f = int(k)
+        c = min(f + 1, n - 1)
+        if f == c:
+            return float(sorted_vals[f])
+        d0 = sorted_vals[f] * (c - k)
+        d1 = sorted_vals[c] * (k - f)
+        return float(d0 + d1)
+
+    # --- Build base filters for Project accessor ---
+    proj_filters = dict(filters)
+    # ensure only Active projects
+    proj_filters[""pj_project_status""] = ""Active""
+    # remove KPI-only controls from being treated as column filters
+    for k in [
+        ""sla_config"",
+        ""risk_threshold_pct"",
+        ""breach_threshold_pct"",
+        ""milestone_pairs"",
+        ""include_gc"",
+    ]:
+        if k in proj_filters:
+            proj_filters.pop(k, None)
+
+    # Fetch active projects (wide milestone columns are not available via accessor output),
+    # so use raw SQL to retrieve the milestone date columns needed for configured pairs.
+    # We still use Tier-1 to validate/filter project population if caller provides additional project filters.
+    _ = get_project(execute_query, proj_filters)
+
+    # Determine required milestone columns
+    needed_ms_cols = set()
+    for milestone_name, predecessor_name, _sla in milestone_pairs:
+        if milestone_name:
+            needed_ms_cols.add(milestone_name)
+        if predecessor_name:
+            needed_ms_cols.add(predecessor_name)
+
+    # Base columns needed for grouping
+    base_cols = [""pj_project_id"", ""rgn_region"", ""m_area"", ""m_market""]
+    if include_gc:
+        base_cols.append(""pj_general_contractor"")
+
+    select_cols = base_cols + sorted(needed_ms_cols)
+
+    where_parts = [""pj_project_status = 'Active'""]
+
+    # Optional entity filters
+    for fcol in [""pj_project_id"", ""rgn_region"", ""m_area"", ""m_market"", ""pj_general_contractor"", ""pj_project_type"", ""pj_program_name""]:
+        if fcol in filters and filters.get(fcol) not in (None, """"):
+            escaped = str(filters.get(fcol)).replace(""'"", ""''"")
+            where_parts.append(f""{fcol} = '{escaped}'"")
+
+    sql = (
+        ""SELECT ""
+        + "", "".join([f""{c}"" for c in select_cols])
+        + "" FROM pwc_macro_staging_schema.stg_ndpd_mbt_tmobile_macro_combined""
+        + ("" WHERE "" + "" AND "".join(where_parts) if where_parts else """")
+    )
+
+    rows = execute_query(sql, db=""pwc_macro_staging_schema"", max_rows=None) or []
+
+    today = datetime.date.today()
+
+    # --- Unpivot milestone pairs into waiting rows ---
+    waiting_rows = []
+    for r in rows:
+        pj_project_id = r.get(""pj_project_id"")
+        rgn_region = r.get(""rgn_region"")
+        m_area = r.get(""m_area"")
+        m_market = r.get(""m_market"")
+        pj_general_contractor = r.get(""pj_general_contractor"") if include_gc else None
+
+        for milestone_name, predecessor_name, default_sla in milestone_pairs:
+            if not milestone_name or not predecessor_name:
+                continue
+
+            predecessor_date = _to_date(r.get(predecessor_name))
+            current_milestone_date = _to_date(r.get(milestone_name))
+
+            # include only if predecessor completed and current milestone not complete
+            if predecessor_date is None:
+                continue
+            if current_milestone_date is not None:
+                continue
+
+            expected_sla_days = sla_override.get(milestone_name, default_sla)
+            if expected_sla_days in (None, 0, ""0""):
+                # cannot compute SLA pct
+                continue
+            expected_sla_days = float(expected_sla_days)
+
+            aging_days = (today - predecessor_date).days
+            sla_pct = (aging_days / expected_sla_days) * 100.0
+
+            if sla_pct < risk_threshold_pct:
+                status = ""On Track""
+            elif sla_pct < breach_threshold_pct:
+                status = ""At Risk""
+            else:
+                status = ""Breached""
+
+            out = {
+                ""pj_project_id"": pj_project_id,
+                ""rgn_region"": rgn_region,
+                ""m_area"": m_area,
+                ""m_market"": m_market,
+                ""milestone_name"": milestone_name,
+                ""predecessor_name"": predecessor_name,
+                ""predecessor_date"": predecessor_date.isoformat(),
+                ""expected_sla_days"": expected_sla_days,
+                ""aging_days"": aging_days,
+                ""sla_pct"": sla_pct,
+                ""status"": status,
+            }
+            if include_gc:
+                out[""pj_general_contractor""] = pj_general_contractor
+
+            waiting_rows.append(out)
+
+    # --- Aggregate output ---
+    # Aggregate by (rgn_region, m_area, m_market, milestone_name) (+ optional GC)
+    agg = {}
+    for wr in waiting_rows:
+        key = (
+            wr.get(""rgn_region""),
+            wr.get(""m_area""),
+            wr.get(""m_market""),
+            wr.get(""milestone_name""),
+            wr.get(""pj_general_contractor"") if include_gc else None,
+        )
+        if key not in agg:
+            agg[key] = {
+                ""rgn_region"": wr.get(""rgn_region""),
+                ""m_area"": wr.get(""m_area""),
+                ""m_market"": wr.get(""m_market""),
+                ""milestone_name"": wr.get(""milestone_name""),
+                ""_project_ids"": set(),
+                ""_aging_days"": [],
+                ""at_risk_count"": 0,
+                ""breached_count"": 0,
+            }
+            if include_gc:
+                agg[key][""pj_general_contractor""] = wr.get(""pj_general_contractor"")
+
+        agg[key][""_project_ids""].add(wr.get(""pj_project_id""))
+        agg[key][""_aging_days""].append(int(wr.get(""aging_days"", 0)))
+        if wr.get(""status"") == ""At Risk"":
+            agg[key][""at_risk_count""] += 1
+        elif wr.get(""status"") == ""Breached"":
+            agg[key][""breached_count""] += 1
+
+    results = []
+    for k, v in agg.items():
+        aging = sorted(v[""_aging_days""])
+        total_waiting = len(v[""_project_ids""])
+        avg_aging_days = float(mean(aging)) if aging else None
+        p90_aging_days = _percentile_cont(aging, 0.9) if aging else None
+
+        rec = {
+            ""rgn_region"": v.get(""rgn_region""),
+            ""m_area"": v.get(""m_area""),
+            ""m_market"": v.get(""m_market""),
+            ""milestone_name"": v.get(""milestone_name""),
+            ""total_waiting"": total_waiting,
+            ""at_risk_count"": int(v.get(""at_risk_count"", 0)),
+            ""breached_count"": int(v.get(""breached_count"", 0)),
+            ""avg_aging_days"": avg_aging_days,
+            ""p90_aging_days"": p90_aging_days,
+        }
+        if include_gc:
+            rec[""pj_general_contractor""] = v.get(""pj_general_contractor"")
+
+        results.append(rec)
+
+    # Deterministic ordering
+    results.sort(
+        key=lambda x: (
+            (x.get(""rgn_region"") or """"),
+            (x.get(""m_area"") or """"),
+            (x.get(""m_market"") or """"),
+            (x.get(""milestone_name"") or """"),
+            (x.get(""pj_general_contractor"") or """") if include_gc else """",
+        )
+    )
+
+    return results
+",NTM/AHLOA,,,,,,
+,,,    -- Optional filters (inject dynamically if needed),,,,,
+,,,    -- AND s_site_id = '<site_code>',,,,,
+,,,    -- AND m_market = '<market>',,,,,
+,,,    -- AND (construction_gc = '<gc>' OR pj_general_contractor = '<gc>'),,,,,
+,,,"),",,,,,
+,,,,,,,,
+,,,filtered AS (,,,,,
+,,,"    SELECT *,",,,,,
+,,,"        DATEDIFF(day, construction_start_date, on_air_date) AS cycle_days",,,,,
+,,,    FROM base,,,,,
+,,,    WHERE,,,,,
+,,,        construction_start_date IS NOT NULL,,,,,
+,,,        AND on_air_date IS NOT NULL,,,,,
+,,,"        AND DATEDIFF(day, construction_start_date, on_air_date) >= 0",,,,,
+,,,,,,,,
+,,,        -- Date filters (apply on on_air_date),,,,,
+,,,        -- AND on_air_date >= '<start_date>',,,,,
+,,,        -- AND on_air_date <= '<end_date>',,,,,
+,,,),,,,,
+,,,,,,,,
+,,,SELECT,,,,,
+,,,"    'On-Air Cycle Time' AS kpi,",,,,,
+,,,"    AVG(cycle_days) AS avg_cycle_time_days,",,,,,
+,,,    COUNT(*) AS projects_count,,,,,
+,,,FROM filtered;,,,,,
